@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stock Market Analyzer — NSE / BSE</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <div id="app">
+    <!-- Top Bar -->
+    <header id="topBar">
+      <div class="top-left">
+        <div class="logo">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M3 17L9 11L13 15L21 7" stroke="#26a69a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M17 7H21V11" stroke="#26a69a" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span>Stock Analyzer</span>
+        </div>
+        <div class="search-box">
+          <div class="search-wrapper">
+            <input type="text" id="symbolInput" placeholder="Search stocks... (e.g. RELIANCE, TCS, INFY)" spellcheck="false" autocomplete="off">
+            <div id="searchDropdown" class="search-dropdown hidden"></div>
+          </div>
+          <select id="exchangeSelect" title="Exchange">
+            <option value="NSE" selected>NSE</option>
+            <option value="BSE">BSE</option>
+          </select>
+          <div class="tf-group" title="Chart timeframe">
+            <button class="tf-btn active" data-interval="1d">D</button>
+            <button class="tf-btn" data-interval="1wk">W</button>
+            <button class="tf-btn" data-interval="1mo">M</button>
+          </div>
+          <select id="periodSelect" title="Chart zoom">
+            <option value="1mo">1M</option>
+            <option value="3mo">3M</option>
+            <option value="6mo">6M</option>
+            <option value="1y" selected>1Y</option>
+            <option value="2y">2Y</option>
+            <option value="5y">5Y</option>
+            <option value="all">ALL</option>
+          </select>
+          <button id="analyzeBtn">Analyze</button>
+        </div>
+      </div>
+      <div class="top-right">
+        <div id="priceDisplay" class="price-display hidden">
+          <span id="priceName" class="price-name"></span>
+          <span id="priceValue" class="price-value"></span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Content: Chart + Sidebar -->
+    <main id="mainContent">
+      <!-- Chart Area -->
+      <div id="chartArea">
+        <div id="chartContainer"></div>
+        <div id="chartLegend" class="chart-legend hidden">
+          <span class="legend-item"><span class="legend-dot" style="background:#f5c542"></span>SMA 20</span>
+          <span class="legend-item"><span class="legend-dot" style="background:#2196F3"></span>SMA 50</span>
+          <span class="legend-item"><span class="legend-dot" style="background:#e040fb"></span>SMA 200</span>
+          <span class="legend-item"><span class="legend-marker">▲</span> Entry</span>
+          <span class="legend-item"><span class="legend-marker exit-marker">▼</span> Exit</span>
+        </div>
+        <!-- Empty state -->
+        <div id="emptyState" class="empty-state">
+          <div class="empty-icon">
+            <svg width="64" height="64" viewBox="0 0 24 24" fill="none"><path d="M3 17L9 11L13 15L21 7" stroke="#2a2d3a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M17 7H21V11" stroke="#2a2d3a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+          <h2>Search for any NSE / BSE stock</h2>
+          <p>Type any stock symbol — <strong>RELIANCE</strong>, <strong>TCS</strong>, <strong>INFY</strong>, <strong>ZOMATO</strong>, <strong>IRCTC</strong>, or any other</p>
+          <p class="empty-hint">Works for all ~2200 NSE-listed stocks. Just type the symbol and hit Analyze.</p>
+          <div class="quick-picks">
+            <span class="quick-pick" data-symbol="RELIANCE">RELIANCE</span>
+            <span class="quick-pick" data-symbol="TCS">TCS</span>
+            <span class="quick-pick" data-symbol="HDFCBANK">HDFC Bank</span>
+            <span class="quick-pick" data-symbol="INFY">INFY</span>
+            <span class="quick-pick" data-symbol="TATAMOTORS">TATA Motors</span>
+            <span class="quick-pick" data-symbol="BAJFINANCE">Bajaj Finance</span>
+          </div>
+        </div>
+        <!-- Loading overlay -->
+        <div id="loadingOverlay" class="loading-overlay hidden">
+          <div class="loader"></div>
+          <p>Analyzing <span id="loadingSymbol"></span>...</p>
+        </div>
+      </div>
+
+      <!-- Sidebar -->
+      <aside id="sidebar" class="hidden">
+        <div class="sidebar-scroll">
+          <!-- Signal Banner -->
+          <section class="sidebar-section signal-banner-section">
+            <div id="signalBanner" class="signal-banner">
+              <div>
+                <div class="signal-action" id="sigAction">—</div>
+                <div class="signal-sub" id="sigSub"></div>
+              </div>
+              <div class="signal-right">
+                <div class="confidence-number" id="sigConfidence">—</div>
+                <div class="confidence-label">confidence</div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Entry/Exit Card -->
+          <section class="sidebar-section">
+            <h3 class="section-title">Trade Setup</h3>
+            <div class="trade-grid">
+              <div class="trade-item entry">
+                <div class="trade-label">Entry Price</div>
+                <div class="trade-value" id="entryPrice">—</div>
+                <div class="trade-prob" id="entryProb"></div>
+              </div>
+              <div class="trade-item target">
+                <div class="trade-label">Target Price</div>
+                <div class="trade-value" id="targetPrice">—</div>
+                <div class="trade-prob" id="exitProb"></div>
+              </div>
+              <div class="trade-item stoploss">
+                <div class="trade-label">Stop Loss</div>
+                <div class="trade-value" id="stopLoss">—</div>
+              </div>
+              <div class="trade-item rr">
+                <div class="trade-label">Risk/Reward</div>
+                <div class="trade-value" id="riskReward">—</div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Score Breakdown -->
+          <section class="sidebar-section">
+            <h3 class="section-title">Score Breakdown</h3>
+            <div id="scoreBreakdown" class="score-breakdown"></div>
+          </section>
+
+          <!-- Signal Reasons -->
+          <section class="sidebar-section">
+            <h3 class="section-title toggle-title" data-target="entryReasons">Entry Signals <span class="toggle-arrow">▾</span></h3>
+            <div id="entryReasons" class="reasons-list"></div>
+          </section>
+          <section class="sidebar-section">
+            <h3 class="section-title toggle-title" data-target="exitReasons">Exit Signals <span class="toggle-arrow">▾</span></h3>
+            <div id="exitReasons" class="reasons-list"></div>
+          </section>
+
+          <!-- Technical Indicators -->
+          <section class="sidebar-section">
+            <h3 class="section-title toggle-title" data-target="techGrid">Technical Indicators <span class="toggle-arrow">▾</span></h3>
+            <div id="techGrid" class="tech-grid"></div>
+          </section>
+
+          <!-- Fundamentals -->
+          <section class="sidebar-section">
+            <h3 class="section-title toggle-title" data-target="fundSection">Fundamentals <span class="toggle-arrow">▾</span></h3>
+            <div id="fundSection">
+              <div id="fundScoreDisplay" class="fund-score-display"></div>
+              <div id="fundSignals" class="fund-signals"></div>
+            </div>
+          </section>
+
+          <!-- News -->
+          <section class="sidebar-section">
+            <h3 class="section-title toggle-title" data-target="newsSection">News <span class="toggle-arrow">▾</span></h3>
+            <div id="newsSection" class="news-section"></div>
+          </section>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

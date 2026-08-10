@@ -1,0 +1,284 @@
+/* Stock Market Analyzer — TradingView Overlay Styles */
+
+#sma-overlay-panel {
+  position: fixed;
+  top: 80px;
+  right: 20px;
+  width: 320px;
+  max-height: 80vh;
+  overflow-y: auto;
+  background: #0f1117;
+  border: 1px solid #2a2d3a;
+  border-radius: 12px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+  z-index: 999999;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  color: #e1e4ea;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+#sma-overlay-panel::-webkit-scrollbar { width: 4px; }
+#sma-overlay-panel::-webkit-scrollbar-thumb { background: #2a2d3a; border-radius: 2px; }
+
+.sma-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 14px;
+  background: #1a1d28;
+  border-radius: 12px 12px 0 0;
+  cursor: move;
+  user-select: none;
+  border-bottom: 1px solid #2a2d3a;
+}
+
+.sma-panel-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  font-size: 13px;
+  color: #fff;
+}
+
+.sma-logo { font-size: 16px; }
+
+.sma-symbol {
+  padding: 1px 6px;
+  background: #2a2d3a;
+  border-radius: 4px;
+  font-size: 10px;
+  color: #6366f1;
+  font-weight: 700;
+}
+
+.sma-panel-controls {
+  display: flex;
+  gap: 4px;
+}
+
+.sma-panel-controls button {
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: #2a2d3a;
+  color: #9ca3af;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s;
+}
+
+.sma-panel-controls button:hover { background: #3a3d4a; }
+
+.sma-panel-body { padding: 14px; }
+
+.sma-signal-hero {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 14px;
+}
+
+.sma-action {
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+}
+
+.sma-confidence {
+  font-size: 24px;
+  font-weight: 800;
+  color: #fff;
+}
+
+.sma-price-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.sma-price-item {
+  display: flex;
+  flex-direction: column;
+  text-align: center;
+}
+
+.sma-label {
+  font-size: 10px;
+  color: #6b7280;
+  text-transform: uppercase;
+}
+
+.sma-val {
+  font-size: 13px;
+  font-weight: 700;
+  color: #e1e4ea;
+}
+
+.sma-green { color: #10b981 !important; }
+.sma-red { color: #ef4444 !important; }
+
+.sma-scores {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.sma-score-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sma-score-label {
+  width: 80px;
+  font-size: 11px;
+  color: #9ca3af;
+}
+
+.sma-score-track {
+  flex: 1;
+  height: 6px;
+  background: #2a2d3a;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.sma-score-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.5s ease;
+}
+
+.sma-score-num {
+  width: 28px;
+  text-align: right;
+  font-size: 11px;
+  font-weight: 700;
+  color: #e1e4ea;
+}
+
+.sma-reasons-section { margin-bottom: 12px; }
+
+.sma-reasons-title {
+  font-size: 11px;
+  color: #6b7280;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 6px;
+}
+
+.sma-reason {
+  padding: 6px 8px;
+  margin-bottom: 4px;
+  background: #12141e;
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.sma-reason-bull { border-left: 3px solid #10b981; }
+.sma-reason-bear { border-left: 3px solid #ef4444; }
+
+.sma-rr {
+  text-align: center;
+  padding: 8px;
+  background: #12141e;
+  border-radius: 6px;
+  font-size: 12px;
+  color: #9ca3af;
+}
+
+.sma-rr strong { color: #fff; }
+
+/* Chart Markers Layer */
+.sma-markers-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 10;
+}
+
+.sma-chart-marker {
+  position: absolute;
+  pointer-events: all;
+  cursor: pointer;
+  font-size: 14px;
+  transition: transform 0.15s;
+  filter: drop-shadow(0 2px 4px rgba(0,0,0,0.5));
+}
+
+.sma-chart-marker:hover { transform: scale(1.4); }
+
+.sma-marker-entry { color: #10b981; }
+.sma-marker-exit { color: #ef4444; }
+
+.sma-marker-tooltip {
+  position: fixed;
+  padding: 10px 12px;
+  background: #1a1d28;
+  border: 1px solid #2a2d3a;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+  z-index: 9999999;
+  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 12px;
+  color: #e1e4ea;
+  pointer-events: none;
+  min-width: 160px;
+}
+
+.sma-tt-type {
+  font-size: 13px;
+  font-weight: 800;
+  margin-bottom: 4px;
+}
+
+.sma-tt-date { color: #6b7280; font-size: 11px; }
+.sma-tt-price { font-size: 14px; font-weight: 700; margin: 2px 0; }
+.sma-tt-reason { color: #9ca3af; font-size: 11px; margin-top: 4px; }
+.sma-tt-strength { color: #6366f1; font-size: 10px; text-transform: uppercase; margin-top: 2px; }
+
+/* Price Level Lines */
+.sma-price-lines-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 9;
+}
+
+.sma-price-line {
+  position: absolute;
+  width: 100%;
+  left: 0;
+}
+
+.sma-price-line:nth-child(1) { top: 35%; }
+.sma-price-line:nth-child(2) { top: 20%; }
+.sma-price-line:nth-child(3) { top: 65%; }
+
+.sma-price-tag {
+  position: absolute;
+  right: 0;
+  top: -10px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 700;
+  color: #fff;
+  white-space: nowrap;
+  font-family: -apple-system, sans-serif;
+}
