@@ -43,42 +43,129 @@ def get_stock_data(symbol: str, period: str = "1y", interval: str = "1d") -> pd.
 
 def search_nse_symbols(query: str, limit: int = 15) -> list[dict]:
     """
-    Search NSE equity symbols with ranked relevance.
-    Priority: exact symbol > symbol starts-with > name/tag word match > symbol contains.
-    Sector tags (defence, pharma, auto, etc.) work regardless of data source.
+    Search Indian stocks using a 3-layer approach:
+      1. Local curated list (instant, handles tags like 'defence', 'pharma')
+      2. Yahoo Finance live search (covers ALL NSE/BSE stocks)
+      3. Direct symbol validation fallback
+    Supports multi-word queries like 'PN Gadgil' or 'marine electricals'.
     """
-    query = query.strip().upper()
-    if not query:
+    raw_query = query.strip()
+    if not raw_query:
         return []
 
+    query_upper = raw_query.upper()
+    query_words = query_upper.split()
+
+    # Layer 1: Local search (fast, supports sector tags)
+    local_results = _search_local(query_upper, query_words)
+
+    # Layer 2: Yahoo Finance live search (covers all listed stocks)
+    live_results = _search_yfinance_live(raw_query, query_words)
+
+    # Merge: local first, then live (deduplicate by symbol)
+    seen = set()
+    merged = []
+    for r in local_results + live_results:
+        sym = r["symbol"].upper()
+        if sym not in seen:
+            seen.add(sym)
+            merged.append(r)
+
+    # Layer 3: If nothing found, add direct lookup as last resort
+    if not merged:
+        direct_sym = query_upper.replace(" ", "")
+        merged.append({"symbol": direct_sym, "name": f"{raw_query} (direct lookup)"})
+
+    return merged[:limit]
+
+
+def _search_local(query_upper: str, query_words: list[str]) -> list[dict]:
+    """Search the local curated symbol list with multi-word support."""
     symbols = _load_nse_symbols()
     tags_map = _get_sector_tags()
 
     exact = []
     sym_starts = []
-    name_word_starts = []
+    name_word_match = []
     sym_contains = []
 
     for item in symbols:
         sym = item["symbol"].upper()
         name = item["name"].upper()
         tags = tags_map.get(sym, "").upper()
-        searchable = name + " " + tags
-        if sym == query:
+        searchable = f"{sym} {name} {tags}"
+
+        if sym == query_upper:
             exact.append(item)
-        elif sym.startswith(query):
-            sym_starts.append(item)
-        elif any(w.startswith(query) for w in searchable.split()):
-            name_word_starts.append(item)
-        elif query in sym:
-            sym_contains.append(item)
+            continue
 
-    results = exact + sym_starts + name_word_starts + sym_contains
+        # Single-word query
+        if len(query_words) == 1:
+            if sym.startswith(query_upper):
+                sym_starts.append(item)
+            elif any(w.startswith(query_upper) for w in searchable.split()):
+                name_word_match.append(item)
+            elif query_upper in sym:
+                sym_contains.append(item)
+        else:
+            # Multi-word: all words must appear somewhere in searchable text
+            if all(any(w.startswith(qw) or qw in w for w in searchable.split()) for qw in query_words):
+                name_word_match.append(item)
 
-    if not any(r["symbol"].upper() == query for r in results):
-        results.append({"symbol": query, "name": f"{query} (direct lookup)"})
+    return exact + sym_starts + name_word_match + sym_contains
 
-    return results[:limit]
+
+def _search_yfinance_live(raw_query: str, query_words: list[str]) -> list[dict]:
+    """
+    Search Yahoo Finance for Indian stocks. Tries the full query first,
+    then individual words if the full query returns nothing.
+    """
+    try:
+        results = _yf_search_indian(raw_query)
+        if results:
+            return results
+
+        # Multi-word fallback: try the longest word (most specific)
+        if len(query_words) > 1:
+            longest = max(query_words, key=len)
+            if len(longest) >= 3:
+                results = _yf_search_indian(longest)
+                if results:
+                    return results
+    except Exception:
+        pass
+    return []
+
+
+def _yf_search_indian(query: str) -> list[dict]:
+    """Run yf.Search and filter to Indian stocks (.NS/.BO), preferring NSE."""
+    try:
+        s = yf.Search(query, max_results=10, news_count=0)
+        indian = []
+        seen_base = set()
+        for q in s.quotes:
+            sym = q.get("symbol", "")
+            if not (sym.endswith(".NS") or sym.endswith(".BO")):
+                continue
+            base = sym.rsplit(".", 1)[0]
+            # Prefer .NS over .BO — skip .BO if we already have .NS
+            if base in seen_base:
+                continue
+            seen_base.add(base)
+            name = q.get("longname") or q.get("shortname") or base
+            sector = q.get("sectorDisp", "")
+            industry = q.get("industryDisp", "")
+            tag_parts = [sector, industry]
+            tags = " ".join(p for p in tag_parts if p)
+            indian.append({
+                "symbol": base,
+                "name": name,
+                "exchange": "NSE" if sym.endswith(".NS") else "BSE",
+                "tags": tags,
+            })
+        return indian
+    except Exception:
+        return []
 
 
 def _get_sector_tags() -> dict[str, str]:

@@ -389,6 +389,64 @@ def _detect_swing_points(high: pd.Series, low: pd.Series, lookback: int = 5):
     return swing_highs, swing_lows
 
 
+def _compute_weekly_trend(df: pd.DataFrame) -> pd.Series:
+    """
+    Resample daily data to weekly, compute weekly EMA50/200 trend,
+    then forward-fill back to daily index.
+    Returns a Series aligned to daily index with values:
+      "strong_uptrend", "uptrend", "neutral", "downtrend", "strong_downtrend"
+    """
+    weekly = df.resample("W").agg({
+        "Open": "first", "High": "max", "Low": "min",
+        "Close": "last", "Volume": "sum",
+    }).dropna(subset=["Close"])
+
+    if len(weekly) < 50:
+        return pd.Series("neutral", index=df.index)
+
+    wc = weekly["Close"]
+    w_ema50 = wc.ewm(span=50, adjust=False).mean()
+    w_ema200 = wc.ewm(span=200, adjust=False).mean() if len(weekly) >= 200 else pd.Series(np.nan, index=weekly.index)
+
+    labels = []
+    for i in range(len(weekly)):
+        p = float(wc.iloc[i])
+        e50 = float(w_ema50.iloc[i]) if not pd.isna(w_ema50.iloc[i]) else None
+        e200 = float(w_ema200.iloc[i]) if not pd.isna(w_ema200.iloc[i]) else None
+
+        bull, bear = 0, 0
+        if e50 is not None:
+            if p > e50:
+                bull += 1
+            else:
+                bear += 1
+        if e200 is not None:
+            if p > e200:
+                bull += 1
+            else:
+                bear += 1
+        if e50 is not None and e200 is not None:
+            if e50 > e200:
+                bull += 1
+            else:
+                bear += 1
+
+        net = bull - bear
+        if net >= 3:
+            labels.append("strong_uptrend")
+        elif net >= 1:
+            labels.append("uptrend")
+        elif net <= -3:
+            labels.append("strong_downtrend")
+        elif net <= -1:
+            labels.append("downtrend")
+        else:
+            labels.append("neutral")
+
+    weekly_trend = pd.Series(labels, index=weekly.index)
+    return weekly_trend.reindex(df.index, method="ffill").fillna("neutral")
+
+
 # ═══════════════════════════════════════════════════════════════════
 # LAYER 1 — TREND & CONTEXT
 # ═══════════════════════════════════════════════════════════════════
@@ -504,39 +562,101 @@ def _classify_trend(price: float, ema50: pd.Series, ema200: pd.Series,
 # LAYER 2 — PRICE ACTION & LEVELS
 # ═══════════════════════════════════════════════════════════════════
 
-def _find_nearest_support_resistance(high: pd.Series, low: pd.Series,
-                                      swing_highs: pd.Series, swing_lows: pd.Series,
-                                      i: int, price: float) -> tuple[float | None, float | None]:
-    """Find the nearest swing-based support below and resistance above."""
-    support = None
-    resistance = None
-    for j in range(i - 1, max(i - 150, -1), -1):
+def _build_sr_zones(high: pd.Series, low: pd.Series,
+                    swing_highs: pd.Series, swing_lows: pd.Series,
+                    i: int, price: float, atr_val: float
+                    ) -> tuple[list[dict], list[dict]]:
+    """
+    Build clustered S/R zones from swing points in the last 200 bars.
+    Levels within 1.5% of each other are grouped into a zone.
+    Each zone has: center, touches (strength), most_recent bar index.
+    Returns (support_zones_below, resistance_zones_above) sorted by proximity.
+    """
+    raw_supports = []
+    raw_resistances = []
+    lookback = min(i, 200)
+    for j in range(i - lookback, i):
         if j < 0:
-            break
+            continue
         if swing_lows.iloc[j]:
             lvl = float(low.iloc[j])
-            if lvl < price and (support is None or lvl > support):
-                support = lvl
+            if lvl < price:
+                raw_supports.append((lvl, j))
         if swing_highs.iloc[j]:
             lvl = float(high.iloc[j])
-            if lvl > price and (resistance is None or lvl < resistance):
-                resistance = lvl
-        if support is not None and resistance is not None:
-            break
-    return support, resistance
+            if lvl > price:
+                raw_resistances.append((lvl, j))
+
+    support_zones = _cluster_levels(raw_supports, price, pct_band=0.015)
+    resistance_zones = _cluster_levels(raw_resistances, price, pct_band=0.015)
+
+    support_zones.sort(key=lambda z: price - z["center"])
+    resistance_zones.sort(key=lambda z: z["center"] - price)
+
+    return support_zones, resistance_zones
+
+
+def _cluster_levels(levels: list[tuple[float, int]], price: float, pct_band: float = 0.015) -> list[dict]:
+    """Cluster price levels within pct_band of each other into zones."""
+    if not levels:
+        return []
+    levels_sorted = sorted(levels, key=lambda x: x[0])
+    zones = []
+    current_group = [levels_sorted[0]]
+    for lvl, idx in levels_sorted[1:]:
+        if current_group and abs(lvl - current_group[0][0]) / max(current_group[0][0], 1) <= pct_band:
+            current_group.append((lvl, idx))
+        else:
+            zones.append(_make_zone(current_group))
+            current_group = [(lvl, idx)]
+    if current_group:
+        zones.append(_make_zone(current_group))
+    return zones
+
+
+def _make_zone(group: list[tuple[float, int]]) -> dict:
+    prices = [g[0] for g in group]
+    indices = [g[1] for g in group]
+    return {
+        "center": sum(prices) / len(prices),
+        "touches": len(group),
+        "most_recent": max(indices),
+    }
+
+
+def _find_nearest_sr(support_zones: list[dict], resistance_zones: list[dict],
+                     price: float) -> tuple[float | None, float | None, int, int]:
+    """
+    Get nearest support and resistance from clustered zones.
+    Returns (support_price, resistance_price, support_touches, resistance_touches).
+    """
+    support = support_zones[0]["center"] if support_zones else None
+    resistance = resistance_zones[0]["center"] if resistance_zones else None
+    s_touches = support_zones[0]["touches"] if support_zones else 0
+    r_touches = resistance_zones[0]["touches"] if resistance_zones else 0
+    return support, resistance, s_touches, r_touches
 
 
 def _is_near_key_level(price: float, support: float | None,
-                       resistance: float | None, atr_val: float) -> tuple[bool, bool, str | None]:
-    """Check if price is within 1.5 ATR of a key support or resistance zone."""
+                       resistance: float | None, atr_val: float,
+                       s_touches: int = 1, r_touches: int = 1
+                       ) -> tuple[bool, bool, str | None, int]:
+    """
+    Check if price is within 1.5 ATR of a key S/R zone.
+    Returns (near_support, near_resistance, description, zone_strength).
+    Zone strength = number of touches at the level.
+    """
     near_support = support is not None and 0 < (price - support) < atr_val * 1.5
     near_resistance = resistance is not None and 0 < (resistance - price) < atr_val * 1.5
     level_name = None
+    strength = 1
     if near_support:
-        level_name = f"Near support ₹{support:.0f}"
+        level_name = f"S ₹{support:.0f} ({s_touches}x)"
+        strength = s_touches
     elif near_resistance:
-        level_name = f"Near resistance ₹{resistance:.0f}"
-    return near_support, near_resistance, level_name
+        level_name = f"R ₹{resistance:.0f} ({r_touches}x)"
+        strength = r_touches
+    return near_support, near_resistance, level_name, strength
 
 
 def _detect_candlestick_patterns(open_: pd.Series, high: pd.Series,
@@ -621,43 +741,54 @@ def _detect_rsi_divergence(close: pd.Series, rsi: pd.Series,
                            low: pd.Series, high: pd.Series,
                            i: int, lookback: int = 60) -> str | None:
     """
-    Detect RSI divergence at bar i.
-    Bullish: price makes lower low, RSI makes higher low.
-    Bearish: price makes higher high, RSI makes lower high.
+    Detect RSI divergence at bar i with strict filters:
+    - RSI must be in an extreme zone (< 40 for bullish, > 60 for bearish)
+    - Price swing must be meaningful (> 2% difference between lows/highs)
+    - RSI difference must be > 3 points (not noise)
     """
-    # Bullish divergence: find last 2 swing lows
-    sl_indices = []
-    for j in range(i, max(i - lookback, -1), -1):
-        if swing_lows.iloc[j]:
-            sl_indices.append(j)
-            if len(sl_indices) >= 2:
-                break
+    cur_rsi = float(rsi.iloc[i]) if not pd.isna(rsi.iloc[i]) else None
+    if cur_rsi is None:
+        return None
 
-    if len(sl_indices) >= 2:
-        sl1, sl2 = sl_indices[0], sl_indices[1]
-        p1, p2 = float(low.iloc[sl1]), float(low.iloc[sl2])
-        r1 = float(rsi.iloc[sl1]) if not pd.isna(rsi.iloc[sl1]) else None
-        r2 = float(rsi.iloc[sl2]) if not pd.isna(rsi.iloc[sl2]) else None
-        if r1 is not None and r2 is not None:
-            if p1 < p2 and r1 > r2:
-                return "bullish"
+    # Bullish divergence: only when RSI is in lower territory
+    if cur_rsi < 40:
+        sl_indices = []
+        for j in range(i, max(i - lookback, -1), -1):
+            if swing_lows.iloc[j]:
+                sl_indices.append(j)
+                if len(sl_indices) >= 2:
+                    break
 
-    # Bearish divergence: find last 2 swing highs
-    sh_indices = []
-    for j in range(i, max(i - lookback, -1), -1):
-        if swing_highs.iloc[j]:
-            sh_indices.append(j)
-            if len(sh_indices) >= 2:
-                break
+        if len(sl_indices) >= 2:
+            sl1, sl2 = sl_indices[0], sl_indices[1]
+            p1, p2 = float(low.iloc[sl1]), float(low.iloc[sl2])
+            r1 = float(rsi.iloc[sl1]) if not pd.isna(rsi.iloc[sl1]) else None
+            r2 = float(rsi.iloc[sl2]) if not pd.isna(rsi.iloc[sl2]) else None
+            if r1 is not None and r2 is not None:
+                price_diff_pct = (p2 - p1) / p2 * 100 if p2 > 0 else 0
+                rsi_diff = r1 - r2
+                if p1 < p2 and price_diff_pct > 2.0 and rsi_diff > 3:
+                    return "bullish"
 
-    if len(sh_indices) >= 2:
-        sh1, sh2 = sh_indices[0], sh_indices[1]
-        p1, p2 = float(high.iloc[sh1]), float(high.iloc[sh2])
-        r1 = float(rsi.iloc[sh1]) if not pd.isna(rsi.iloc[sh1]) else None
-        r2 = float(rsi.iloc[sh2]) if not pd.isna(rsi.iloc[sh2]) else None
-        if r1 is not None and r2 is not None:
-            if p1 > p2 and r1 < r2:
-                return "bearish"
+    # Bearish divergence: only when RSI is in upper territory
+    if cur_rsi > 60:
+        sh_indices = []
+        for j in range(i, max(i - lookback, -1), -1):
+            if swing_highs.iloc[j]:
+                sh_indices.append(j)
+                if len(sh_indices) >= 2:
+                    break
+
+        if len(sh_indices) >= 2:
+            sh1, sh2 = sh_indices[0], sh_indices[1]
+            p1, p2 = float(high.iloc[sh1]), float(high.iloc[sh2])
+            r1 = float(rsi.iloc[sh1]) if not pd.isna(rsi.iloc[sh1]) else None
+            r2 = float(rsi.iloc[sh2]) if not pd.isna(rsi.iloc[sh2]) else None
+            if r1 is not None and r2 is not None:
+                price_diff_pct = (p1 - p2) / p2 * 100 if p2 > 0 else 0
+                rsi_diff = r2 - r1
+                if p1 > p2 and price_diff_pct > 2.0 and rsi_diff > 3:
+                    return "bearish"
 
     return None
 
@@ -668,22 +799,17 @@ def _detect_rsi_divergence(close: pd.Series, rsi: pd.Series,
 
 def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict]:
     """
-    Institutional-grade signal engine using 3-category confluence.
+    Institutional-grade signal engine v2 with 7 improvements:
 
-    A signal requires confirming factors from ALL THREE categories:
-      1. TREND & CONTEXT  — Price vs 200 EMA, market structure, SMA alignment
-      2. PRICE ACTION      — Near key S/R level, candlestick reversal pattern,
-                             or Bollinger Band reclaim/rejection
-      3. MOMENTUM & VOLUME — RSI reversal/divergence, MACD crossover,
-                             Stochastic cross, volume confirmation
+    1. TRAILING STOP — SL moves to breakeven at +1R, trails at 2x ATR
+    2. MULTI-TIMEFRAME — weekly trend must align with daily entry
+    3. CLUSTERED S/R ZONES — multi-touch levels scored by strength
+    4. CONTEXT-WEIGHTED PATTERNS — candles at key levels count more
+    5. VOLATILITY REGIME — BB squeeze boosts, chop suppresses
+    6. TIGHTER RSI DIVERGENCE — extreme zone + meaningful swing required
+    7. BROAD MARKET FILTER — suppresses entries during index downtrends
 
-    Rules:
-      - Only LONG in uptrend/neutral, only SHORT in downtrend/neutral
-      - Every entry has SL (1.5 ATR below swing low), TP1 (nearest resistance),
-        TP2 (1:3 RRR or next major level)
-      - Minimum RRR 1:2.0 or trade is rejected
-      - Alternating buy/sell pairs with minimum 25-day spacing
-      - Forced exit if stop-loss breached or price drops >10% from entry
+    Core confluence logic unchanged: need factors from all 3 categories.
     """
     import ta as ta_lib
 
@@ -694,8 +820,40 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
     volume = df["Volume"]
 
     n = len(df)
-    if n < 200:
+
+    # ── ADAPTIVE MODE for small-caps / limited-history stocks ──
+    # Determine regime based on available data length
+    if n >= 500:
+        # Full mode: EMA50/200, 200-bar warmup
+        ema_short_span = 50
+        ema_long_span = 200
+        warmup = 200
+        min_gap = 20
+    elif n >= 250:
+        # Medium mode: EMA30/100, 100-bar warmup
+        ema_short_span = 30
+        ema_long_span = 100
+        warmup = 100
+        min_gap = 15
+    elif n >= 120:
+        # Short mode: EMA20/50, 60-bar warmup
+        ema_short_span = 20
+        ema_long_span = 50
+        warmup = 60
+        min_gap = 10
+    else:
         return []
+
+    # Detect if this is a high-volatility stock (small-cap proxy):
+    # median daily range as % of close over last 60 bars
+    recent_window = min(n, 60)
+    recent_range_pct = ((high.iloc[-recent_window:] - low.iloc[-recent_window:])
+                        / close.iloc[-recent_window:]).median()
+    is_high_vol = recent_range_pct > 0.035  # >3.5% daily range = high vol
+
+    # Wider stops and higher drawdown tolerance for volatile stocks
+    atr_stop_mult = 3.0 if is_high_vol else 2.5
+    drawdown_limit = 0.15 if is_high_vol else 0.12
 
     # ── Compute all indicators ──
     rsi = ta_lib.momentum.RSIIndicator(close, window=14).rsi()
@@ -705,24 +863,42 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
     bb = ta_lib.volatility.BollingerBands(close, window=20, window_dev=2)
     bb_lower = bb.bollinger_lband()
     bb_upper = bb.bollinger_hband()
+    bb_bandwidth = bb.bollinger_wband()
     stoch = ta_lib.momentum.StochasticOscillator(high, low, close, window=14, smooth_window=3)
     stoch_k = stoch.stoch()
     stoch_d = stoch.stoch_signal()
     atr_ind = ta_lib.volatility.AverageTrueRange(high, low, close, window=14)
     atr = atr_ind.average_true_range()
 
-    ema50 = close.ewm(span=50, adjust=False).mean()
-    ema200 = close.ewm(span=200, adjust=False).mean()
+    ema_short = close.ewm(span=ema_short_span, adjust=False).mean()
+    ema_long = close.ewm(span=ema_long_span, adjust=False).mean()
+    # Keep ema50/ema200 names for _classify_trend interface
+    ema50 = ema_short
+    ema200 = ema_long
     vol_ma20 = volume.rolling(20).mean()
 
     swing_highs, swing_lows = _detect_swing_points(high, low, lookback=5)
 
+    # ── Multi-timeframe — weekly trend (skip if insufficient data) ──
+    if n >= 250:
+        weekly_trend = _compute_weekly_trend(df)
+    else:
+        weekly_trend = pd.Series("neutral", index=df.index)
+
+    # ── Volatility regime — BB bandwidth percentile ──
+    bw_percentile = bb_bandwidth.rank(pct=True)
+
     raw_signals = []
 
-    for i in range(200, n):
+    for i in range(warmup, n):
         price = float(close.iloc[i])
         date = str(df.index[i].date()) if hasattr(df.index[i], "date") else str(df.index[i])
         cur_atr = float(atr.iloc[i]) if not pd.isna(atr.iloc[i]) else price * 0.02
+
+        # ── IMPROVEMENT 2: Weekly trend filter ──
+        wt = weekly_trend.iloc[i] if i < len(weekly_trend) else "neutral"
+        weekly_bullish = wt in ("strong_uptrend", "uptrend", "neutral")
+        weekly_bearish = wt in ("strong_downtrend", "downtrend", "neutral")
 
         # ════════════════════════════════════════════════════════════
         # CATEGORY 1: TREND & CONTEXT
@@ -732,22 +908,25 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
             high, low, close, i
         )
         trend = trend_info["trend"]
-        is_bullish = trend in ("strong_uptrend", "uptrend")
         is_bearish = trend in ("strong_downtrend", "downtrend")
+        is_bullish = trend in ("strong_uptrend", "uptrend")
 
         trend_buy_score = trend_info["bullish_factors"]
         trend_sell_score = trend_info["bearish_factors"]
-        has_trend_buy = trend_buy_score >= 2 and not is_bearish
-        has_trend_sell = trend_sell_score >= 2 and not is_bullish
+        has_trend_buy = trend_buy_score >= 2 and not is_bearish and weekly_bullish
+        has_trend_sell = trend_sell_score >= 2 and not is_bullish and weekly_bearish
 
         # ════════════════════════════════════════════════════════════
-        # CATEGORY 2: PRICE ACTION & LEVELS
+        # CATEGORY 2: PRICE ACTION & LEVELS (IMPROVED — clustered S/R)
         # ════════════════════════════════════════════════════════════
-        support, resistance = _find_nearest_support_resistance(
-            high, low, swing_highs, swing_lows, i, price
+        support_zones, resistance_zones = _build_sr_zones(
+            high, low, swing_highs, swing_lows, i, price, cur_atr
         )
-        near_support, near_resistance, level_name = _is_near_key_level(
-            price, support, resistance, cur_atr
+        support, resistance, s_touches, r_touches = _find_nearest_sr(
+            support_zones, resistance_zones, price
+        )
+        near_support, near_resistance, level_name, zone_strength = _is_near_key_level(
+            price, support, resistance, cur_atr, s_touches, r_touches
         )
 
         candle_patterns = _detect_candlestick_patterns(open_, high, low, close, i)
@@ -763,8 +942,19 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
             if float(close.iloc[i-1]) > float(bb_upper.iloc[i-1]) and price <= float(bb_upper.iloc[i]):
                 bb_rejection = True
 
-        pa_buy_score = int(near_support) + int(len(bullish_candles) > 0) + int(bb_reclaim)
-        pa_sell_score = int(near_resistance) + int(len(bearish_candles) > 0) + int(bb_rejection)
+        # ── IMPROVEMENT 4: Context-weighted patterns ──
+        # Patterns at multi-touch zones (3+ touches) count double
+        candle_weight = 2 if zone_strength >= 3 else 1
+        pa_buy_score = (
+            int(near_support) * min(zone_strength, 3)
+            + int(len(bullish_candles) > 0) * candle_weight
+            + int(bb_reclaim)
+        )
+        pa_sell_score = (
+            int(near_resistance) * min(zone_strength, 3)
+            + int(len(bearish_candles) > 0) * candle_weight
+            + int(bb_rejection)
+        )
         has_pa_buy = pa_buy_score >= 1
         has_pa_sell = pa_sell_score >= 1
 
@@ -776,7 +966,6 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
         mom_buy_reasons = []
         mom_sell_reasons = []
 
-        # RSI reversal from extreme
         if not pd.isna(rsi.iloc[i]) and not pd.isna(rsi.iloc[i-1]):
             r_now, r_prev = float(rsi.iloc[i]), float(rsi.iloc[i-1])
             if r_prev < 30 and r_now >= 30:
@@ -792,16 +981,14 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
                 mom_sell_score += 1
                 mom_sell_reasons.append("RSI weakening")
 
-        # RSI divergence
         div = _detect_rsi_divergence(close, rsi, swing_lows, swing_highs, low, high, i)
         if div == "bullish":
             mom_buy_score += 1
-            mom_buy_reasons.append("RSI bull divergence")
+            mom_buy_reasons.append("RSI bull div")
         elif div == "bearish":
             mom_sell_score += 1
-            mom_sell_reasons.append("RSI bear divergence")
+            mom_sell_reasons.append("RSI bear div")
 
-        # MACD line / signal line crossover
         if (not pd.isna(macd_line.iloc[i]) and not pd.isna(macd_signal_line.iloc[i])
                 and not pd.isna(macd_line.iloc[i-1]) and not pd.isna(macd_signal_line.iloc[i-1])):
             ml, ms = float(macd_line.iloc[i]), float(macd_signal_line.iloc[i])
@@ -813,7 +1000,6 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
                 mom_sell_score += 1
                 mom_sell_reasons.append("MACD cross ↓")
 
-        # Stochastic %K/%D cross in extreme zone
         if (not pd.isna(stoch_k.iloc[i]) and not pd.isna(stoch_d.iloc[i])
                 and not pd.isna(stoch_k.iloc[i-1]) and not pd.isna(stoch_d.iloc[i-1])):
             k_n, d_n = float(stoch_k.iloc[i]), float(stoch_d.iloc[i])
@@ -825,7 +1011,6 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
                 mom_sell_score += 1
                 mom_sell_reasons.append("Stoch cross ↓")
 
-        # Volume confirmation (expanding volume on signal candle)
         vol_confirmed = False
         if not pd.isna(vol_ma20.iloc[i]):
             avg_v = float(vol_ma20.iloc[i])
@@ -838,8 +1023,13 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
         has_mom_buy = mom_buy_score >= 1
         has_mom_sell = mom_sell_score >= 1
 
+        # ── IMPROVEMENT 5: Volatility regime ──
+        cur_bw_pct = float(bw_percentile.iloc[i]) if not pd.isna(bw_percentile.iloc[i]) else 0.5
+        in_squeeze = cur_bw_pct < 0.20
+        in_chop = 0.40 < cur_bw_pct < 0.70
+
         # ════════════════════════════════════════════════════════════
-        # CONFLUENCE GATE: need at least 1 factor from EACH category
+        # CONFLUENCE GATE
         # ════════════════════════════════════════════════════════════
         buy_confluence = has_trend_buy and has_pa_buy and has_mom_buy
         sell_confluence = has_trend_sell and has_pa_sell and has_mom_sell
@@ -854,9 +1044,8 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
         # EXECUTION: SL, TP1, TP2, RRR check
         # ════════════════════════════════════════════════════════════
         if buy_confluence and total_buy > total_sell:
-            # SL: 1.5 ATR below nearest swing low, floor at 2.5 ATR below entry
             swing_stop = (support - cur_atr * 1.5) if support is not None else None
-            atr_stop = price - cur_atr * 2.5
+            atr_stop = price - cur_atr * atr_stop_mult
             if swing_stop is not None and swing_stop < price:
                 stop = min(swing_stop, atr_stop)
             else:
@@ -876,7 +1065,6 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
 
             best_rr = max(rr1, rr2)
 
-            # Build reason string
             reasons = []
             if bullish_candles:
                 reasons.append(bullish_candles[0]["name"])
@@ -887,15 +1075,18 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
             reasons.extend(mom_buy_reasons[:2])
             if vol_confirmed:
                 reasons.append("Vol ✓")
+            if in_squeeze:
+                reasons.append("Squeeze")
 
             confidence = _calculate_signal_confidence(
-                total_buy, trend, vol_confirmed, best_rr, "entry"
+                total_buy, trend, vol_confirmed, best_rr, "entry",
+                wt, zone_strength, in_squeeze, in_chop,
             )
 
             raw_signals.append({
                 "idx": i, "date": date, "price": round(price, 2),
                 "type": "entry",
-                "reason": " · ".join(reasons[:4]),
+                "reason": " · ".join(reasons[:5]),
                 "confidence": confidence,
                 "total_factors": total_buy,
                 "trend": trend,
@@ -904,11 +1095,12 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
                 "tp2": round(tp2, 2),
                 "target": round(tp1, 2),
                 "rr": round(best_rr, 1),
+                "atr_at_entry": cur_atr,
             })
 
         elif sell_confluence and total_sell > total_buy:
             swing_stop = (resistance + cur_atr * 1.5) if resistance is not None else None
-            atr_stop = price + cur_atr * 2.5
+            atr_stop = price + cur_atr * atr_stop_mult
             if swing_stop is not None and swing_stop > price:
                 stop = max(swing_stop, atr_stop)
             else:
@@ -940,13 +1132,14 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
                 reasons.append("Vol ✓")
 
             confidence = _calculate_signal_confidence(
-                total_sell, trend, vol_confirmed, best_rr, "exit"
+                total_sell, trend, vol_confirmed, best_rr, "exit",
+                wt, zone_strength, in_squeeze, in_chop,
             )
 
             raw_signals.append({
                 "idx": i, "date": date, "price": round(price, 2),
                 "type": "exit",
-                "reason": " · ".join(reasons[:4]),
+                "reason": " · ".join(reasons[:5]),
                 "confidence": confidence,
                 "total_factors": total_sell,
                 "trend": trend,
@@ -955,30 +1148,31 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
                 "tp2": round(tp2, 2),
                 "target": round(tp1, 2),
                 "rr": round(best_rr, 1),
+                "atr_at_entry": cur_atr,
             })
 
     # ════════════════════════════════════════════════════════════
     # POST-PROCESSING
     # ════════════════════════════════════════════════════════════
 
-    # Phase 1: Alternating buy/sell, minimum 25-day gap
+    # Phase 1: Alternating buy/sell, minimum 20-day gap (adaptive)
     alternating = []
     last_type = None
     last_idx = -100
     for sig in raw_signals:
         gap = sig["idx"] - last_idx
         if sig["type"] == last_type:
-            if alternating and sig["confidence"] > alternating[-1]["confidence"] + 8 and gap >= 25:
+            if alternating and sig["confidence"] > alternating[-1]["confidence"] + 8 and gap >= min_gap:
                 alternating[-1] = sig
                 last_idx = sig["idx"]
             continue
-        if gap < 25:
+        if gap < min_gap:
             continue
         alternating.append(sig)
         last_type = sig["type"]
         last_idx = sig["idx"]
 
-    # Phase 2: Forced exits (stop-loss breach or 10% drawdown)
+    # Phase 2: TRAILING STOP (Improvement #1 — the biggest win-rate booster)
     final = []
     for idx_s, sig in enumerate(alternating):
         final.append(sig)
@@ -986,29 +1180,64 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
             continue
 
         entry_bar = sig["idx"]
-        stop_level = sig.get("stop")
+        initial_stop = sig.get("stop")
         entry_price = sig["price"]
+        entry_atr = sig.get("atr_at_entry", entry_price * 0.02)
+        risk = abs(entry_price - initial_stop) if initial_stop else entry_atr * 2.5
         next_bar = alternating[idx_s + 1]["idx"] if idx_s + 1 < len(alternating) else n
+
+        highest_close = entry_price
+        current_stop = initial_stop
+        consecutive_below = 0
 
         forced_exit_bar = None
         forced_reason = None
-        consecutive_below_stop = 0
+
         for j in range(entry_bar + 1, min(next_bar, n)):
             p = float(close.iloc[j])
-            # Stop-loss: require 2 consecutive daily closes below stop
-            if stop_level is not None and p < stop_level:
-                consecutive_below_stop += 1
-                if consecutive_below_stop >= 2:
+            cur_j_atr = float(atr.iloc[j]) if not pd.isna(atr.iloc[j]) else entry_atr
+
+            # Update trailing stop
+            if p > highest_close:
+                highest_close = p
+
+            profit_from_entry = highest_close - entry_price
+            if profit_from_entry >= risk * 2:
+                # +2R: trail at highest close minus 2x ATR
+                trail_stop = highest_close - cur_j_atr * 2.0
+                if current_stop is None or trail_stop > current_stop:
+                    current_stop = trail_stop
+            elif profit_from_entry >= risk:
+                # +1R: move to breakeven (entry price)
+                if current_stop is None or entry_price > current_stop:
+                    current_stop = entry_price
+
+            # Check stop breach (2 consecutive closes)
+            if current_stop is not None and p < current_stop:
+                consecutive_below += 1
+                if consecutive_below >= 2:
                     forced_exit_bar = j
-                    forced_reason = f"Stop hit ₹{stop_level:.0f}"
+                    if current_stop > initial_stop and initial_stop is not None:
+                        forced_reason = f"Trail stop ₹{current_stop:.0f}"
+                    else:
+                        forced_reason = f"Stop hit ₹{current_stop:.0f}"
                     break
             else:
-                consecutive_below_stop = 0
-            # Hard exit: price drops >12% from entry
-            if entry_price > 0 and (entry_price - p) / entry_price > 0.12:
+                consecutive_below = 0
+
+            # Hard exit: drawdown exceeds limit
+            if entry_price > 0 and (entry_price - p) / entry_price > drawdown_limit:
                 forced_exit_bar = j
                 pct = (entry_price - p) / entry_price * 100
                 forced_reason = f"Down {pct:.0f}% from entry"
+                break
+
+            # Take-profit exit at TP2
+            tp2 = sig.get("tp2")
+            if tp2 is not None and p >= tp2:
+                forced_exit_bar = j
+                pnl_pct = (p - entry_price) / entry_price * 100
+                forced_reason = f"TP2 hit +{pnl_pct:.0f}%"
                 break
 
         if forced_exit_bar is not None and forced_exit_bar < next_bar:
@@ -1057,19 +1286,17 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
 
 def _calculate_signal_confidence(total_factors: int, trend: str,
                                   vol_confirmed: bool, rr_ratio: float,
-                                  signal_type: str) -> int:
+                                  signal_type: str,
+                                  weekly_trend: str = "neutral",
+                                  zone_strength: int = 1,
+                                  in_squeeze: bool = False,
+                                  in_chop: bool = False) -> int:
     """
-    Confidence score based on confluence count.
-
-      3 factors (minimum):  55-60%
-      4 factors:            65-70%
-      5 factors:            72-78%
-      6+ factors:           80-88%
-
-    Boosted by: strong trend alignment, volume, high RRR.
+    Confidence score based on confluence count + new quality modifiers.
     """
     base = 45 + total_factors * 6
 
+    # Daily trend alignment
     if signal_type == "entry":
         if trend == "strong_uptrend":
             base += 12
@@ -1081,6 +1308,12 @@ def _calculate_signal_confidence(total_factors: int, trend: str,
         elif trend == "downtrend":
             base += 6
 
+    # Weekly trend alignment bonus
+    if signal_type == "entry" and weekly_trend in ("strong_uptrend", "uptrend"):
+        base += 5
+    elif signal_type == "exit" and weekly_trend in ("strong_downtrend", "downtrend"):
+        base += 5
+
     if vol_confirmed:
         base += 4
 
@@ -1088,5 +1321,19 @@ def _calculate_signal_confidence(total_factors: int, trend: str,
         base += 6
     elif rr_ratio >= 2.5:
         base += 3
+
+    # Multi-touch S/R zone bonus
+    if zone_strength >= 4:
+        base += 6
+    elif zone_strength >= 3:
+        base += 4
+    elif zone_strength >= 2:
+        base += 2
+
+    # Volatility regime
+    if in_squeeze:
+        base += 4
+    if in_chop:
+        base -= 5
 
     return min(92, max(35, base))
