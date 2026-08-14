@@ -98,8 +98,12 @@ async def analyze_stock(
         raise HTTPException(status_code=400, detail="interval must be 1d, 1wk, or 1mo")
     try:
         symbol = resolve_indian_symbol(symbol, exchange)
+
+        # CRITICAL: OHLCV is the only required call — everything else degrades gracefully
         df = get_stock_data(symbol, period="max", interval=interval)
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
+
+        # Non-critical calls — each silently returns defaults on failure
         fundamentals = get_fundamentals(symbol)
         balance_sheet = get_balance_sheet(symbol)
         income_stmt = get_income_statement(symbol)
@@ -110,7 +114,6 @@ async def analyze_stock(
         fund_analysis = analyze_fundamentals(fundamentals, balance_sheet, income_stmt)
         signals = generate_signals(df, technical, fund_analysis, earnings, news)
 
-        # Build OHLCV for the chart
         candles = []
         volumes = []
         for idx, row in df.iterrows():
@@ -120,10 +123,7 @@ async def analyze_stock(
             color = "rgba(22,163,74,0.4)" if c >= o else "rgba(220,38,38,0.4)"
             volumes.append({"time": ts, "value": int(row["Volume"]), "color": color})
 
-        # Build chart markers from historical signals (with timestamps)
         chart_markers = _build_chart_markers(df, signals.get("historical_signals", []))
-
-        # Build SMA overlay lines for the chart
         sma_lines = _build_sma_lines(df)
 
         return _sanitize({
@@ -147,7 +147,10 @@ async def analyze_stock(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+        error_msg = str(e)
+        if "Too Many Requests" in error_msg or "Rate" in error_msg or "429" in error_msg:
+            raise HTTPException(status_code=429, detail="Yahoo Finance rate limit — please wait 30 seconds and try again.")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {error_msg}")
 
 
 @app.get("/api/fundamental/{symbol}")

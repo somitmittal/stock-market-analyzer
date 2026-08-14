@@ -415,6 +415,12 @@ function renderSidebar(data) {
   const tech = data.technical;
   const fund = data.fundamental;
 
+  // Pump & dump warning
+  renderPumpDumpWarning(signals.pump_dump_risk);
+
+  // Score trend
+  renderScoreTrend(signals.score_trend);
+
   // Signal banner with colored badge
   const actionEl = document.getElementById("sigAction");
   actionEl.textContent = signals.action;
@@ -511,6 +517,65 @@ function renderSidebar(data) {
   } else {
     newsSection.innerHTML = '<div class="fund-signal-item">No recent news</div>';
   }
+}
+
+// ──────────────────────────────────────
+// Pump & Dump Warning
+// ──────────────────────────────────────
+function renderPumpDumpWarning(pd) {
+  const section = document.getElementById("pumpDumpSection");
+  if (!pd || !pd.detected) {
+    section.classList.add("hidden");
+    return;
+  }
+  section.classList.remove("hidden");
+
+  const levelEl = document.getElementById("pdLevel");
+  levelEl.textContent = pd.risk_level.toUpperCase() + " RISK";
+  levelEl.className = "pd-level " + pd.risk_level;
+
+  document.getElementById("pdReasons").innerHTML = pd.reasons
+    .map((r) => `<div>&#8226; ${r}</div>`)
+    .join("");
+}
+
+// ──────────────────────────────────────
+// Score Trend
+// ──────────────────────────────────────
+function renderScoreTrend(trend) {
+  if (!trend || !trend.bars || trend.bars.length === 0) return;
+
+  const dirEl = document.getElementById("trendDirection");
+  dirEl.textContent = trend.direction;
+  dirEl.className = "trend-direction " + trend.direction;
+
+  const scoreEl = document.getElementById("trendScore");
+  const sc = trend.current_score;
+  scoreEl.textContent = (sc > 0 ? "+" : "") + sc;
+  scoreEl.className = "trend-score " + (sc > 15 ? "positive" : sc < -15 ? "negative" : "neutral");
+
+  const badgesEl = document.getElementById("trendBadges");
+  let badges = "";
+  if (trend.momentum_shift) {
+    badges += '<span class="trend-badge momentum-shift">Momentum Shift</span>';
+  }
+  if (trend.volume_surge) {
+    badges += '<span class="trend-badge volume-surge">Volume Surge</span>';
+  }
+  badgesEl.innerHTML = badges;
+
+  const barsEl = document.getElementById("trendBars");
+  const maxAbs = Math.max(1, ...trend.bars.map((b) => Math.abs(b.score)));
+
+  barsEl.innerHTML = trend.bars
+    .map((b) => {
+      const pct = Math.max(8, (Math.abs(b.score) / maxAbs) * 100);
+      let cls = b.score > 10 ? "positive" : b.score < -10 ? "negative" : "neutral-bar";
+      if (b.volume_signal === "surge_buy" || b.volume_signal === "high_buy") cls += " surge";
+      if (b.volume_signal === "surge_sell" || b.volume_signal === "high_sell") cls += " sell-surge";
+      return `<div class="trend-bar ${cls}" style="height:${pct}%" title="${b.date}: ${b.score} (${b.volume_signal})"></div>`;
+    })
+    .join("");
 }
 
 // ──────────────────────────────────────

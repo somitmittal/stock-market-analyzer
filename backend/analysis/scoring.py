@@ -17,7 +17,7 @@ def generate_signals(
 ) -> dict:
     """
     Generate entry/exit signals with probability scores.
-    Returns current recommendation, historical signals, and reasoning.
+    Returns current recommendation, historical signals, score trend, and reasoning.
     """
     tech_score = _score_technical(technical)
     fund_score = fundamental_analysis.get("overall_score", 50)
@@ -45,7 +45,17 @@ def generate_signals(
 
     risk_reward = abs(exit_price - entry_price) / abs(entry_price - stop_loss) if abs(entry_price - stop_loss) > 0 else 0
 
-    action = _determine_action(entry_probability, tech_score, fundamental_analysis)
+    # Live score trend + pump-and-dump detection
+    score_trend = _compute_live_score_trend(df)
+    pump_dump = _detect_pump_and_dump(df)
+
+    # Adjust composite if pump-and-dump detected
+    if pump_dump["detected"]:
+        composite = min(composite, 55)
+        entry_probability = min(55, entry_probability)
+
+    action = _determine_action(entry_probability, tech_score, fundamental_analysis,
+                               pump_dump_detected=pump_dump["detected"])
 
     historical_signals = _generate_historical_signals(df, technical)
 
@@ -73,6 +83,8 @@ def generate_signals(
         },
         "technical_signals": tech_score["signals"],
         "historical_signals": historical_signals,
+        "score_trend": score_trend,
+        "pump_dump_risk": pump_dump,
     }
 
 
@@ -315,13 +327,15 @@ def _calculate_stop_loss(entry_price: float, technical: dict, sr: dict, atr: flo
     return round(max(support2, atr_stop), 2)
 
 
-def _determine_action(probability: float, tech_score: dict, fund_analysis: dict) -> str:
+def _determine_action(probability: float, tech_score: dict, fund_analysis: dict,
+                      pump_dump_detected: bool = False) -> str:
     """
     STRONG BUY requires ALL of:
       1. Composite score >= 80
       2. Technical score >= 75 (multiple indicators must agree)
       3. Fundamentals not negative (>= 45)
       4. At least 4 bullish technical signals firing
+      5. NOT a pump-and-dump pattern
     This ensures STRONG BUY only appears at high-confluence points
     where the probability of making maximum returns is highest.
     """
@@ -332,6 +346,9 @@ def _determine_action(probability: float, tech_score: dict, fund_analysis: dict)
         1 for s in tech_score.get("signals", [])
         if s.get("impact", "").startswith("+")
     )
+
+    if pump_dump_detected:
+        return "HOLD"
 
     # STRONG BUY: very high bar — multiple confirmations required
     if (probability >= 80
@@ -369,6 +386,258 @@ def _determine_action(probability: float, tech_score: dict, fund_analysis: dict)
         return "LEAN SELL"
 
     return "LEAN SELL"
+
+
+def _compute_live_score_trend(df: pd.DataFrame, lookback: int = 20) -> dict:
+    """
+    Compute a rolling buy/sell strength score for each of the last `lookback`
+    bars. Tracks how momentum is building up or dissipating in real time.
+
+    Each bar gets a score from -100 (extreme bearish) to +100 (extreme bullish)
+    based on: EMA alignment, RSI, MACD, volume direction + magnitude, and
+    price position.
+
+    Returns:
+      direction: "strengthening" | "stable" | "weakening"
+      current_score: latest bar score
+      momentum_shift: True if score changed > 30 pts in last 5 bars
+      volume_surge: True if abnormal buying volume in last 3 bars
+      bars: list of {date, score, volume_signal} for each bar
+    """
+    import ta as ta_lib
+
+    n = len(df)
+    if n < 50:
+        return {"direction": "stable", "current_score": 0,
+                "momentum_shift": False, "volume_surge": False, "bars": []}
+
+    close = df["Close"]
+    open_ = df["Open"]
+    volume = df["Volume"]
+
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    rsi = ta_lib.momentum.RSIIndicator(close, window=14).rsi()
+    macd_ind = ta_lib.trend.MACD(close, window_slow=26, window_fast=12, window_sign=9)
+    macd_line = macd_ind.macd()
+    macd_signal = macd_ind.macd_signal()
+    vol_ma10 = volume.rolling(10).mean()
+    vol_max_60 = volume.rolling(60).max()
+
+    start = max(0, n - lookback)
+    bars = []
+
+    for i in range(start, n):
+        score = 0
+        p = float(close.iloc[i])
+        e20 = float(ema20.iloc[i]) if not pd.isna(ema20.iloc[i]) else p
+        e50 = float(ema50.iloc[i]) if not pd.isna(ema50.iloc[i]) else p
+
+        if p > e20:
+            score += 12
+        else:
+            score -= 12
+        if p > e50:
+            score += 12
+        else:
+            score -= 12
+        if e20 > e50:
+            score += 8
+        else:
+            score -= 8
+
+        r = float(rsi.iloc[i]) if not pd.isna(rsi.iloc[i]) else 50
+        if r < 30:
+            score += 15
+        elif r < 40:
+            score += 8
+        elif r > 70:
+            score -= 15
+        elif r > 60:
+            score -= 8
+
+        ml = float(macd_line.iloc[i]) if not pd.isna(macd_line.iloc[i]) else 0
+        ms = float(macd_signal.iloc[i]) if not pd.isna(macd_signal.iloc[i]) else 0
+        if ml > ms:
+            score += 10
+        elif ml < ms:
+            score -= 10
+        if ml > 0:
+            score += 5
+        elif ml < 0:
+            score -= 5
+
+        cur_v = float(volume.iloc[i]) if not pd.isna(volume.iloc[i]) else 0
+        avg_v = float(vol_ma10.iloc[i]) if not pd.isna(vol_ma10.iloc[i]) else 0
+        max_v = float(vol_max_60.iloc[i]) if not pd.isna(vol_max_60.iloc[i]) else 0
+        is_green = float(close.iloc[i]) > float(open_.iloc[i])
+
+        vol_signal = "normal"
+        if avg_v > 0 and cur_v > avg_v * 1.5:
+            if is_green:
+                score += 18
+                vol_signal = "high_buy"
+            else:
+                score -= 18
+                vol_signal = "high_sell"
+
+            if max_v > 0 and cur_v >= max_v * 0.85:
+                if is_green:
+                    score += 10
+                    vol_signal = "surge_buy"
+                else:
+                    score -= 10
+                    vol_signal = "surge_sell"
+        elif avg_v > 0 and cur_v > avg_v:
+            if is_green:
+                score += 5
+            else:
+                score -= 5
+
+        score = max(-100, min(100, score))
+
+        dt = str(df.index[i].date()) if hasattr(df.index[i], "date") else str(df.index[i])
+        bars.append({"date": dt, "score": score, "volume_signal": vol_signal})
+
+    if len(bars) < 2:
+        return {"direction": "stable", "current_score": 0,
+                "momentum_shift": False, "volume_surge": False, "bars": bars}
+
+    current_score = bars[-1]["score"]
+
+    recent_5 = bars[-5:] if len(bars) >= 5 else bars
+    score_change = recent_5[-1]["score"] - recent_5[0]["score"]
+    if score_change > 25:
+        direction = "strengthening"
+    elif score_change < -25:
+        direction = "weakening"
+    else:
+        direction = "stable"
+
+    momentum_shift = abs(score_change) > 30
+
+    recent_3_vol = [b["volume_signal"] for b in bars[-3:]]
+    volume_surge = any(v in ("surge_buy", "high_buy") for v in recent_3_vol)
+
+    return {
+        "direction": direction,
+        "current_score": current_score,
+        "momentum_shift": momentum_shift,
+        "volume_surge": volume_surge,
+        "bars": bars,
+    }
+
+
+def _detect_pump_and_dump(df: pd.DataFrame) -> dict:
+    """
+    Detect pump-and-dump patterns to suppress false strong buy signals.
+
+    A P&D is identified by the simultaneous presence of:
+    1. Rapid price surge (>20% in 5 bars or >30% in 10 bars)
+    2. Price extended far above moving averages (>15% above 50 EMA)
+    3. RSI deeply overbought (>80)
+    4. Extreme volume spike (near yearly highs)
+    5. No prior accumulation pattern (volume was low before the spike)
+
+    Returns dict with: detected, risk_level, reasons, confidence_penalty
+    """
+    import ta as ta_lib
+
+    n = len(df)
+    if n < 60:
+        return {"detected": False, "risk_level": "none", "reasons": [], "confidence_penalty": 0}
+
+    close = df["Close"]
+    open_ = df["Open"]
+    volume = df["Volume"]
+    high = df["High"]
+
+    cur_price = float(close.iloc[-1])
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    rsi = ta_lib.momentum.RSIIndicator(close, window=14).rsi()
+    vol_ma20 = volume.rolling(20).mean()
+    vol_max_250 = volume.rolling(min(250, n)).max()
+
+    reasons = []
+    risk_score = 0
+
+    price_5d_ago = float(close.iloc[-6]) if n >= 6 else cur_price
+    price_10d_ago = float(close.iloc[-11]) if n >= 11 else cur_price
+    change_5d = (cur_price - price_5d_ago) / price_5d_ago * 100 if price_5d_ago > 0 else 0
+    change_10d = (cur_price - price_10d_ago) / price_10d_ago * 100 if price_10d_ago > 0 else 0
+
+    if change_5d > 30:
+        risk_score += 4
+        reasons.append(f"Price surged {change_5d:.0f}% in 5 days")
+    elif change_5d > 20:
+        risk_score += 3
+        reasons.append(f"Price up {change_5d:.0f}% in 5 days")
+    elif change_10d > 30:
+        risk_score += 2
+        reasons.append(f"Price up {change_10d:.0f}% in 10 days")
+
+    e50 = float(ema50.iloc[-1]) if not pd.isna(ema50.iloc[-1]) else cur_price
+    extension_pct = (cur_price - e50) / e50 * 100 if e50 > 0 else 0
+    if extension_pct > 25:
+        risk_score += 3
+        reasons.append(f"Price {extension_pct:.0f}% above 50 EMA (extreme)")
+    elif extension_pct > 15:
+        risk_score += 2
+        reasons.append(f"Price {extension_pct:.0f}% above 50 EMA (extended)")
+
+    cur_rsi = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50
+    if cur_rsi > 85:
+        risk_score += 3
+        reasons.append(f"RSI at {cur_rsi:.0f} (extreme overbought)")
+    elif cur_rsi > 80:
+        risk_score += 2
+        reasons.append(f"RSI at {cur_rsi:.0f} (overbought)")
+
+    cur_vol = float(volume.iloc[-1]) if not pd.isna(volume.iloc[-1]) else 0
+    avg_vol = float(vol_ma20.iloc[-1]) if not pd.isna(vol_ma20.iloc[-1]) else 0
+    max_vol = float(vol_max_250.iloc[-1]) if not pd.isna(vol_max_250.iloc[-1]) else 0
+
+    if max_vol > 0 and cur_vol >= max_vol * 0.9:
+        risk_score += 2
+        reasons.append("Volume at yearly high")
+    elif avg_vol > 0 and cur_vol > avg_vol * 3:
+        risk_score += 2
+        reasons.append(f"Volume {cur_vol/avg_vol:.1f}x above average")
+
+    if avg_vol > 0 and n >= 30:
+        pre_spike_vol = volume.iloc[-30:-6]
+        pre_avg = float(pre_spike_vol.mean()) if len(pre_spike_vol) > 0 else avg_vol
+        recent_avg = float(volume.iloc[-5:].mean())
+        if pre_avg > 0 and recent_avg > pre_avg * 3:
+            risk_score += 2
+            reasons.append("Volume spike after quiet period (P&D pattern)")
+
+    recent_5_red = sum(
+        1 for j in range(-5, 0)
+        if float(close.iloc[j]) < float(open_.iloc[j])
+    )
+    if change_5d > 15 and recent_5_red >= 3:
+        risk_score += 1
+        reasons.append("Choppy rise with many red candles (distribution)")
+
+    if risk_score >= 8:
+        risk_level = "high"
+        penalty = -30
+    elif risk_score >= 5:
+        risk_level = "medium"
+        penalty = -20
+    elif risk_score >= 3:
+        risk_level = "low"
+        penalty = -10
+    else:
+        return {"detected": False, "risk_level": "none", "reasons": [], "confidence_penalty": 0}
+
+    return {
+        "detected": True,
+        "risk_level": risk_level,
+        "reasons": reasons,
+        "confidence_penalty": penalty,
+    }
 
 
 def _detect_swing_points(high: pd.Series, low: pd.Series, lookback: int = 5):
@@ -659,6 +928,143 @@ def _is_near_key_level(price: float, support: float | None,
     return near_support, near_resistance, level_name, strength
 
 
+def _compute_fibonacci_levels(high: pd.Series, low: pd.Series,
+                              swing_highs: pd.Series, swing_lows: pd.Series,
+                              i: int, price: float,
+                              lookback: int = 120) -> dict | None:
+    """
+    Find the most recent significant swing move and compute Fibonacci
+    retracement levels (23.6%, 38.2%, 61.8%).
+
+    Returns dict with:
+      move_type: "up" or "down"
+      swing_low, swing_high: the endpoints of the move
+      levels: dict mapping pct label to price
+      nearest_level: the Fib level closest to current price (or None)
+      distance_pct: how far price is from nearest_level as % of move range
+    Returns None if no significant swing move found.
+    """
+    start = max(0, i - lookback)
+
+    sh_indices = [j for j in range(start, i) if swing_highs.iloc[j]]
+    sl_indices = [j for j in range(start, i) if swing_lows.iloc[j]]
+
+    if not sh_indices or not sl_indices:
+        return None
+
+    last_sh_idx = sh_indices[-1]
+    last_sl_idx = sl_indices[-1]
+    swing_h = float(high.iloc[last_sh_idx])
+    swing_l = float(low.iloc[last_sl_idx])
+
+    move_range = swing_h - swing_l
+    if move_range <= 0 or move_range / swing_l < 0.03:
+        return None
+
+    if last_sl_idx < last_sh_idx:
+        move_type = "up"
+        levels = {
+            "23.6%": swing_h - move_range * 0.236,
+            "38.2%": swing_h - move_range * 0.382,
+            "61.8%": swing_h - move_range * 0.618,
+        }
+    else:
+        move_type = "down"
+        levels = {
+            "23.6%": swing_l + move_range * 0.236,
+            "38.2%": swing_l + move_range * 0.382,
+            "61.8%": swing_l + move_range * 0.618,
+        }
+
+    nearest_label = None
+    nearest_price = None
+    min_dist = float("inf")
+    for label, lvl in levels.items():
+        dist = abs(price - lvl) / move_range
+        if dist < min_dist:
+            min_dist = dist
+            nearest_label = label
+            nearest_price = lvl
+
+    PROXIMITY_THRESHOLD = 0.04
+    if min_dist > PROXIMITY_THRESHOLD:
+        nearest_label = None
+        nearest_price = None
+
+    return {
+        "move_type": move_type,
+        "swing_low": swing_l,
+        "swing_high": swing_h,
+        "levels": levels,
+        "nearest_level": nearest_label,
+        "nearest_price": nearest_price,
+        "distance_pct": min_dist,
+    }
+
+
+def _detect_range_breakout(close: pd.Series, high: pd.Series, low: pd.Series,
+                           volume: pd.Series, vol_ma20: pd.Series,
+                           i: int, support: float | None,
+                           resistance: float | None,
+                           atr_val: float,
+                           min_range_bars: int = 20) -> dict | None:
+    """
+    Detect if stock is breaking out of a consolidation range.
+
+    A range is identified when price has stayed within support-resistance
+    boundaries for min_range_bars. A breakout requires:
+      1. Price closes above resistance (bullish) or below support (bearish)
+      2. Volume is above 20-day average (institutional participation)
+
+    Returns dict with breakout info, or None.
+    """
+    if support is None or resistance is None:
+        return None
+
+    range_width = resistance - support
+    if range_width <= 0 or range_width / support < 0.02:
+        return None
+
+    start = max(0, i - min_range_bars)
+    bars_in_range = 0
+    tolerance = atr_val * 0.5
+    for j in range(start, i):
+        h = float(high.iloc[j])
+        l = float(low.iloc[j])
+        if l >= support - tolerance and h <= resistance + tolerance:
+            bars_in_range += 1
+
+    range_pct = bars_in_range / max(1, i - start)
+    if range_pct < 0.65:
+        return None
+
+    cur_close = float(close.iloc[i])
+    cur_vol = float(volume.iloc[i]) if not pd.isna(volume.iloc[i]) else 0
+    avg_vol = float(vol_ma20.iloc[i]) if not pd.isna(vol_ma20.iloc[i]) else 0
+    vol_confirm = cur_vol > avg_vol * 1.0 if avg_vol > 0 else False
+
+    if cur_close > resistance:
+        return {
+            "direction": "bullish",
+            "breakout_price": resistance,
+            "range_width": range_width,
+            "bars_in_range": bars_in_range,
+            "volume_confirmed": vol_confirm,
+            "target": resistance + range_width,
+        }
+    elif cur_close < support:
+        return {
+            "direction": "bearish",
+            "breakout_price": support,
+            "range_width": range_width,
+            "bars_in_range": bars_in_range,
+            "volume_confirmed": vol_confirm,
+            "target": support - range_width,
+        }
+
+    return None
+
+
 def _detect_candlestick_patterns(open_: pd.Series, high: pd.Series,
                                   low: pd.Series, close: pd.Series,
                                   i: int) -> list[dict]:
@@ -876,6 +1282,11 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
     ema50 = ema_short
     ema200 = ema_long
     vol_ma20 = volume.rolling(20).mean()
+    # Rolling max volume for abnormality detection across multiple timeframes
+    vol_max_20 = volume.rolling(20).max()    # ~1 month
+    vol_max_60 = volume.rolling(60).max()    # ~3 months
+    vol_max_120 = volume.rolling(120).max()  # ~6 months
+    vol_max_250 = volume.rolling(250).max()  # ~1 year
 
     swing_highs, swing_lows = _detect_swing_points(high, low, lookback=5)
 
@@ -898,6 +1309,8 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
         # ── IMPROVEMENT 2: Weekly trend filter ──
         wt = weekly_trend.iloc[i] if i < len(weekly_trend) else "neutral"
         weekly_bullish = wt in ("strong_uptrend", "uptrend", "neutral")
+        # For sells: allow when weekly is bearish/neutral OR when daily
+        # trend is already bearish (daily breakdown overrides weekly lag)
         weekly_bearish = wt in ("strong_downtrend", "downtrend", "neutral")
 
         # ════════════════════════════════════════════════════════════
@@ -914,7 +1327,7 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
         trend_buy_score = trend_info["bullish_factors"]
         trend_sell_score = trend_info["bearish_factors"]
         has_trend_buy = trend_buy_score >= 2 and not is_bearish and weekly_bullish
-        has_trend_sell = trend_sell_score >= 2 and not is_bullish and weekly_bearish
+        has_trend_sell = trend_sell_score >= 2 and not is_bullish and (weekly_bearish or is_bearish)
 
         # ════════════════════════════════════════════════════════════
         # CATEGORY 2: PRICE ACTION & LEVELS (IMPROVED — clustered S/R)
@@ -942,6 +1355,19 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
             if float(close.iloc[i-1]) > float(bb_upper.iloc[i-1]) and price <= float(bb_upper.iloc[i]):
                 bb_rejection = True
 
+        # ── Breakdown detection (sell-side PA) ──
+        # Price breaking below support = sell PA signal
+        support_breakdown = (support is not None and price < support
+                             and float(close.iloc[i-1]) >= support)
+        # Price crossing below 50 EMA (was above within last 3 bars)
+        ema50_breakdown = False
+        e50_now = float(ema50.iloc[i]) if not pd.isna(ema50.iloc[i]) else None
+        if e50_now is not None and price < e50_now:
+            for jj in range(max(0, i - 3), i):
+                if float(close.iloc[jj]) > float(ema50.iloc[jj]):
+                    ema50_breakdown = True
+                    break
+
         # ── IMPROVEMENT 4: Context-weighted patterns ──
         # Patterns at multi-touch zones (3+ touches) count double
         candle_weight = 2 if zone_strength >= 3 else 1
@@ -954,7 +1380,48 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
             int(near_resistance) * min(zone_strength, 3)
             + int(len(bearish_candles) > 0) * candle_weight
             + int(bb_rejection)
+            + int(support_breakdown) * 2
+            + int(ema50_breakdown)
         )
+
+        # ── Fibonacci retracement confluence ──
+        fib_info = _compute_fibonacci_levels(
+            high, low, swing_highs, swing_lows, i, price
+        )
+        fib_at_level = False
+        fib_label = None
+        if fib_info and fib_info["nearest_level"] is not None:
+            fib_label = fib_info["nearest_level"]
+            if fib_info["move_type"] == "up" and bullish_candles:
+                pa_buy_score += 2
+                fib_at_level = True
+            elif fib_info["move_type"] == "down" and bearish_candles:
+                pa_sell_score += 2
+                fib_at_level = True
+            elif fib_info["move_type"] == "up":
+                pa_buy_score += 1
+            elif fib_info["move_type"] == "down":
+                pa_sell_score += 1
+
+        # ── Range breakout detection ──
+        breakout = _detect_range_breakout(
+            close, high, low, volume, vol_ma20, i,
+            support, resistance, cur_atr, min_range_bars=20
+        )
+        breakout_buy = False
+        breakout_sell = False
+        if breakout is not None:
+            if breakout["direction"] == "bullish":
+                pa_buy_score += 2
+                if breakout["volume_confirmed"]:
+                    pa_buy_score += 1
+                breakout_buy = True
+            elif breakout["direction"] == "bearish":
+                pa_sell_score += 2
+                if breakout["volume_confirmed"]:
+                    pa_sell_score += 1
+                breakout_sell = True
+
         has_pa_buy = pa_buy_score >= 1
         has_pa_sell = pa_sell_score >= 1
 
@@ -968,18 +1435,37 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
 
         if not pd.isna(rsi.iloc[i]) and not pd.isna(rsi.iloc[i-1]):
             r_now, r_prev = float(rsi.iloc[i]), float(rsi.iloc[i-1])
+            if r_now < 20:
+                mom_buy_score += 2
+                mom_buy_reasons.append(f"RSI {r_now:.0f} extreme")
+            elif r_now < 25:
+                mom_buy_score += 1
+                mom_buy_reasons.append(f"RSI {r_now:.0f} deeply oversold")
             if r_prev < 30 and r_now >= 30:
                 mom_buy_score += 1
                 mom_buy_reasons.append("RSI ↑30")
             elif r_prev < 40 and r_now >= 40 and r_prev > 25:
                 mom_buy_score += 1
                 mom_buy_reasons.append("RSI recovering")
+            if r_now > 80:
+                mom_sell_score += 2
+                mom_sell_reasons.append(f"RSI {r_now:.0f} extreme")
+            elif r_now > 75:
+                mom_sell_score += 1
+                mom_sell_reasons.append(f"RSI {r_now:.0f} deeply overbought")
             if r_prev > 70 and r_now <= 70:
                 mom_sell_score += 1
                 mom_sell_reasons.append("RSI ↓70")
             elif r_prev > 60 and r_now <= 60 and r_prev < 75:
                 mom_sell_score += 1
                 mom_sell_reasons.append("RSI weakening")
+            # Sustained declining momentum: RSI falling below 45 from above
+            if r_prev >= 45 and r_now < 45:
+                mom_sell_score += 1
+                mom_sell_reasons.append("RSI ↓45")
+            elif r_prev >= 35 and r_now < 35:
+                mom_sell_score += 1
+                mom_sell_reasons.append("RSI ↓35")
 
         div = _detect_rsi_divergence(close, rsi, swing_lows, swing_highs, low, high, i)
         if div == "bullish":
@@ -999,6 +1485,13 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
             elif ml_p >= ms_p and ml < ms:
                 mom_sell_score += 1
                 mom_sell_reasons.append("MACD cross ↓")
+            # MACD crossing below zero = bearish momentum shift
+            if ml_p >= 0 and ml < 0:
+                mom_sell_score += 1
+                mom_sell_reasons.append("MACD ↓0")
+            elif ml_p <= 0 and ml > 0:
+                mom_buy_score += 1
+                mom_buy_reasons.append("MACD ↑0")
 
         if (not pd.isna(stoch_k.iloc[i]) and not pd.isna(stoch_d.iloc[i])
                 and not pd.isna(stoch_k.iloc[i-1]) and not pd.isna(stoch_d.iloc[i-1])):
@@ -1011,14 +1504,77 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
                 mom_sell_score += 1
                 mom_sell_reasons.append("Stoch cross ↓")
 
+        # ── Volume analysis — magnitude + direction ──
+        # Normal volume = no signal. Abnormally high volume = check direction.
+        # Abnormal = approaching or exceeding multi-week/month/year highs.
         vol_confirmed = False
-        if not pd.isna(vol_ma20.iloc[i]):
-            avg_v = float(vol_ma20.iloc[i])
-            cur_v = float(volume.iloc[i])
-            if avg_v > 0 and cur_v > avg_v * 1.3:
+        vol_bearish_pressure = False
+        is_green_candle = float(close.iloc[i]) > float(open_.iloc[i])
+
+        cur_v = float(volume.iloc[i]) if not pd.isna(volume.iloc[i]) else 0
+        avg_v = float(vol_ma20.iloc[i]) if not pd.isna(vol_ma20.iloc[i]) else 0
+
+        # How abnormal is today's volume? Compare to rolling max at different windows
+        vol_abnormality = 0  # 0=normal, 1=high(monthly), 2=very high(quarterly), 3=extreme(yearly)
+        if cur_v > 0 and avg_v > 0:
+            m20 = float(vol_max_20.iloc[i]) if not pd.isna(vol_max_20.iloc[i]) else 0
+            m60 = float(vol_max_60.iloc[i]) if not pd.isna(vol_max_60.iloc[i]) else 0
+            m120 = float(vol_max_120.iloc[i]) if not pd.isna(vol_max_120.iloc[i]) else 0
+            m250 = float(vol_max_250.iloc[i]) if not pd.isna(vol_max_250.iloc[i]) else 0
+
+            if m250 > 0 and cur_v >= m250 * 0.85:
+                vol_abnormality = 3
+            elif m120 > 0 and cur_v >= m120 * 0.85:
+                vol_abnormality = 2
+            elif m60 > 0 and cur_v >= m60 * 0.85:
+                vol_abnormality = 1
+
+        if vol_abnormality >= 1:
+            if is_green_candle:
+                # Abnormally high BUYING volume = strong buy confirmation
                 vol_confirmed = True
-                mom_buy_score += 1 if mom_buy_score > 0 else 0
-                mom_sell_score += 1 if mom_sell_score > 0 else 0
+                mom_buy_score += vol_abnormality
+                if vol_abnormality >= 3:
+                    mom_buy_reasons.append("Extreme buy vol")
+                elif vol_abnormality >= 2:
+                    mom_buy_reasons.append("Heavy buy vol")
+                else:
+                    mom_buy_reasons.append("High buy vol")
+            else:
+                # Abnormally high SELLING volume = institutional distribution
+                mom_sell_score += vol_abnormality
+                if vol_abnormality >= 3:
+                    mom_sell_reasons.append("Extreme sell vol")
+                elif vol_abnormality >= 2:
+                    mom_sell_reasons.append("Heavy sell vol")
+                else:
+                    mom_sell_reasons.append("High sell vol")
+
+        # Check for sustained selling pressure over recent days:
+        # Look at last 10 bars — if multiple have abnormally high RED volume
+        lookback_vol = min(i, 10)
+        abnormal_red_days = 0
+        abnormal_green_days = 0
+        for vj in range(i - lookback_vol, i):
+            if vj < 0:
+                continue
+            vj_vol = float(volume.iloc[vj]) if not pd.isna(volume.iloc[vj]) else 0
+            vj_m60 = float(vol_max_60.iloc[vj]) if not pd.isna(vol_max_60.iloc[vj]) else 0
+            vj_green = float(close.iloc[vj]) > float(open_.iloc[vj])
+            if vj_m60 > 0 and vj_vol >= vj_m60 * 0.7:
+                if vj_green:
+                    abnormal_green_days += 1
+                else:
+                    abnormal_red_days += 1
+
+        if abnormal_red_days >= 3:
+            vol_bearish_pressure = True
+            mom_sell_score += 1
+            mom_sell_reasons.append(f"Sell pressure ({abnormal_red_days}d)")
+        elif abnormal_green_days >= 3 and not vol_confirmed:
+            vol_confirmed = True
+            mom_buy_score += 1
+            mom_buy_reasons.append(f"Buy pressure ({abnormal_green_days}d)")
 
         has_mom_buy = mom_buy_score >= 1
         has_mom_sell = mom_sell_score >= 1
@@ -1028,11 +1584,56 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
         in_squeeze = cur_bw_pct < 0.20
         in_chop = 0.40 < cur_bw_pct < 0.70
 
+        # ── Pump-and-dump suppression for historical buy signals ──
+        is_pump = False
+        if i >= 10:
+            p_5ago = float(close.iloc[i - 5]) if i >= 5 else price
+            surge_5d = (price - p_5ago) / p_5ago * 100 if p_5ago > 0 else 0
+            e50_val = float(ema50.iloc[i]) if not pd.isna(ema50.iloc[i]) else price
+            ext_pct = (price - e50_val) / e50_val * 100 if e50_val > 0 else 0
+            r_val = float(rsi.iloc[i]) if not pd.isna(rsi.iloc[i]) else 50
+            pd_score = 0
+            if surge_5d > 20:
+                pd_score += 2
+            if ext_pct > 15:
+                pd_score += 2
+            if r_val > 80:
+                pd_score += 2
+            if vol_abnormality >= 2 and not is_green_candle:
+                pd_score += 1
+            if pd_score >= 4:
+                is_pump = True
+
+        # ── Contrarian bottoming exception ──
+        # When RSI is deeply oversold, allow buy signals even in downtrends.
+        # Two tiers:
+        #   RSI < 20 (extreme): only need PA signal + green candle or RSI rising
+        #   RSI < 25 (deep):    need PA signal + momentum + green candle or RSI rising
+        is_contrarian_buy = False
+        cur_rsi_val = float(rsi.iloc[i]) if not pd.isna(rsi.iloc[i]) else 50
+        prev_rsi_val = float(rsi.iloc[i-1]) if i > 0 and not pd.isna(rsi.iloc[i-1]) else 50
+        rsi_recovering = cur_rsi_val > prev_rsi_val
+
+        if not has_trend_buy:
+            if cur_rsi_val < 20 and has_pa_buy and (is_green_candle or rsi_recovering):
+                is_contrarian_buy = True
+            elif (cur_rsi_val < 25
+                    and (has_pa_buy or len(bullish_candles) > 0)
+                    and has_mom_buy
+                    and (is_green_candle or rsi_recovering)):
+                is_contrarian_buy = True
+
         # ════════════════════════════════════════════════════════════
         # CONFLUENCE GATE
         # ════════════════════════════════════════════════════════════
         buy_confluence = has_trend_buy and has_pa_buy and has_mom_buy
         sell_confluence = has_trend_sell and has_pa_sell and has_mom_sell
+
+        if is_contrarian_buy:
+            buy_confluence = True
+
+        if is_pump:
+            buy_confluence = False
 
         if not buy_confluence and not sell_confluence:
             continue
@@ -1051,7 +1652,10 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
             else:
                 stop = atr_stop
 
-            tp1 = resistance if resistance is not None else price + cur_atr * 4
+            if breakout_buy and breakout is not None:
+                tp1 = breakout["target"]
+            else:
+                tp1 = resistance if resistance is not None else price + cur_atr * 4
             risk = abs(price - stop)
             tp2 = price + risk * 3
 
@@ -1066,8 +1670,14 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
             best_rr = max(rr1, rr2)
 
             reasons = []
+            if is_contrarian_buy:
+                reasons.append(f"Oversold RSI {cur_rsi_val:.0f}")
+            if breakout_buy:
+                reasons.append("Breakout" + (" +Vol" if breakout["volume_confirmed"] else ""))
             if bullish_candles:
                 reasons.append(bullish_candles[0]["name"])
+            if fib_at_level and fib_label:
+                reasons.append(f"Fib {fib_label}")
             if near_support and level_name:
                 reasons.append(level_name)
             elif bb_reclaim:
@@ -1081,6 +1691,9 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
             confidence = _calculate_signal_confidence(
                 total_buy, trend, vol_confirmed, best_rr, "entry",
                 wt, zone_strength, in_squeeze, in_chop,
+                vol_bearish_pressure, is_green_candle, vol_abnormality,
+                fib_at_level=fib_at_level, is_breakout=breakout_buy,
+                is_contrarian=is_contrarian_buy,
             )
 
             raw_signals.append({
@@ -1106,7 +1719,10 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
             else:
                 stop = atr_stop
 
-            tp1 = support if support is not None else price - cur_atr * 4
+            if breakout_sell and breakout is not None:
+                tp1 = breakout["target"]
+            else:
+                tp1 = support if support is not None else price - cur_atr * 4
             risk = abs(stop - price)
             tp2 = price - risk * 3
 
@@ -1121,8 +1737,16 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
             best_rr = max(rr1, rr2)
 
             reasons = []
+            if support_breakdown:
+                reasons.append("Support break")
+            if ema50_breakdown:
+                reasons.append("Below 50 EMA")
+            if breakout_sell:
+                reasons.append("Breakdown" + (" +Vol" if breakout["volume_confirmed"] else ""))
             if bearish_candles:
                 reasons.append(bearish_candles[0]["name"])
+            if fib_at_level and fib_label:
+                reasons.append(f"Fib {fib_label}")
             if near_resistance and level_name:
                 reasons.append(level_name)
             elif bb_rejection:
@@ -1134,6 +1758,8 @@ def _generate_historical_signals(df: pd.DataFrame, technical: dict) -> list[dict
             confidence = _calculate_signal_confidence(
                 total_sell, trend, vol_confirmed, best_rr, "exit",
                 wt, zone_strength, in_squeeze, in_chop,
+                vol_bearish_pressure, is_green_candle, vol_abnormality,
+                fib_at_level=fib_at_level, is_breakout=breakout_sell,
             )
 
             raw_signals.append({
@@ -1290,13 +1916,21 @@ def _calculate_signal_confidence(total_factors: int, trend: str,
                                   weekly_trend: str = "neutral",
                                   zone_strength: int = 1,
                                   in_squeeze: bool = False,
-                                  in_chop: bool = False) -> int:
+                                  in_chop: bool = False,
+                                  vol_bearish_pressure: bool = False,
+                                  signal_candle_green: bool = True,
+                                  vol_abnormality: int = 0,
+                                  fib_at_level: bool = False,
+                                  is_breakout: bool = False,
+                                  is_contrarian: bool = False) -> int:
     """
-    Confidence score based on confluence count + new quality modifiers.
+    Confidence score based on confluence + volume magnitude/direction.
+    Abnormal volume (multi-month/year highs) is the strongest signal:
+      - Abnormal GREEN volume = institutional buying, big confidence boost
+      - Abnormal RED volume = institutional selling, big confidence penalty
     """
     base = 45 + total_factors * 6
 
-    # Daily trend alignment
     if signal_type == "entry":
         if trend == "strong_uptrend":
             base += 12
@@ -1308,21 +1942,33 @@ def _calculate_signal_confidence(total_factors: int, trend: str,
         elif trend == "downtrend":
             base += 6
 
-    # Weekly trend alignment bonus
     if signal_type == "entry" and weekly_trend in ("strong_uptrend", "uptrend"):
         base += 5
     elif signal_type == "exit" and weekly_trend in ("strong_downtrend", "downtrend"):
         base += 5
 
+    # Volume magnitude + direction (the key differentiator)
     if vol_confirmed:
-        base += 4
+        # Abnormal green volume: scale boost by how extreme it is
+        base += 4 + vol_abnormality * 3  # +4 baseline, up to +13 for yearly-high buy vol
+    elif signal_type == "entry" and vol_abnormality >= 2 and not signal_candle_green:
+        # Abnormally high RED volume on a buy signal = strong penalty
+        base -= 10 + vol_abnormality * 4  # up to -22 for yearly-high sell vol
+    elif signal_type == "entry" and not signal_candle_green:
+        base -= 5
+
+    # Sustained selling pressure over multiple days
+    if vol_bearish_pressure:
+        if signal_type == "entry":
+            base -= 18
+        else:
+            base += 8
 
     if rr_ratio >= 3.5:
         base += 6
     elif rr_ratio >= 2.5:
         base += 3
 
-    # Multi-touch S/R zone bonus
     if zone_strength >= 4:
         base += 6
     elif zone_strength >= 3:
@@ -1330,10 +1976,19 @@ def _calculate_signal_confidence(total_factors: int, trend: str,
     elif zone_strength >= 2:
         base += 2
 
-    # Volatility regime
     if in_squeeze:
         base += 4
     if in_chop:
         base -= 5
+
+    if fib_at_level:
+        base += 5
+    if is_breakout:
+        base += 6
+
+    if is_contrarian:
+        base -= 10
+        if vol_confirmed:
+            base += 8
 
     return min(92, max(35, base))

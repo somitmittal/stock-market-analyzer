@@ -1,6 +1,7 @@
 """
 Stock data fetching module — Indian market focused.
 Uses yfinance for NSE/BSE price data, fundamentals, and financial statements.
+Aggressive caching to avoid Yahoo Finance rate limits on shared cloud IPs.
 """
 import yfinance as yf
 import pandas as pd
@@ -14,18 +15,47 @@ import io
 import os
 import json
 import time
+import threading
+import logging
+
+logger = logging.getLogger(__name__)
 
 _NSE_SYMBOLS_CACHE: dict = {"data": None, "ts": 0}
 _NSE_CACHE_FILE = os.path.join(os.path.dirname(__file__), "nse_symbols.json")
 
-_SECTOR_TAGS: dict[str, str] = {}  # populated lazily from fallback list
+_SECTOR_TAGS: dict[str, str] = {}
+
+# ── TTL cache for all Yahoo Finance data ──
+_cache: dict[str, dict] = {}
+_cache_lock = threading.Lock()
+
+_OHLCV_TTL = 300       # 5 minutes — price data refreshes often
+_FUNDAMENTAL_TTL = 21600  # 6 hours — fundamentals rarely change intraday
+_NEWS_TTL = 3600        # 1 hour
+
+def _cache_get(key: str) -> any:
+    with _cache_lock:
+        entry = _cache.get(key)
+        if entry and time.time() - entry["ts"] < entry["ttl"]:
+            return entry["val"]
+    return None
+
+def _cache_set(key: str, val: any, ttl: int):
+    with _cache_lock:
+        _cache[key] = {"val": val, "ts": time.time(), "ttl": ttl}
+
+def _get_ticker(symbol: str) -> yf.Ticker:
+    """Get or create a cached Ticker instance (avoids re-creating HTTP sessions)."""
+    key = f"_ticker:{symbol}"
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    t = yf.Ticker(symbol)
+    _cache_set(key, t, 3600)
+    return t
 
 
 def resolve_indian_symbol(symbol: str, exchange: str = "NSE") -> str:
-    """
-    Ensure a symbol has the correct yfinance suffix for Indian markets.
-    If user types 'RELIANCE', convert to 'RELIANCE.NS' or 'RELIANCE.BO'.
-    """
     symbol = symbol.strip().upper()
     if symbol.endswith(".NS") or symbol.endswith(".BO"):
         return symbol
@@ -34,10 +64,16 @@ def resolve_indian_symbol(symbol: str, exchange: str = "NSE") -> str:
 
 
 def get_stock_data(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
-    ticker = yf.Ticker(symbol)
+    cache_key = f"ohlcv:{symbol}:{period}:{interval}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    ticker = _get_ticker(symbol)
     df = ticker.history(period=period, interval=interval)
     if df.empty:
         raise ValueError(f"No data found for {symbol}. Check the symbol — for NSE use symbols like RELIANCE, TCS, INFY.")
+    _cache_set(cache_key, df, _OHLCV_TTL)
     return df
 
 
@@ -565,11 +601,20 @@ def _get_fallback_symbols() -> list[dict]:
 
 
 def get_fundamentals(symbol: str) -> dict:
-    ticker = yf.Ticker(symbol)
-    info = ticker.info or {}
+    cache_key = f"fund:{symbol}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
 
-    return {
-        "company_name": info.get("longName", symbol),
+    try:
+        ticker = _get_ticker(symbol)
+        info = ticker.info or {}
+    except Exception as e:
+        logger.warning(f"get_fundamentals({symbol}) failed: {e}")
+        return {"company_name": symbol}
+
+    result = {
+        "company_name": info.get("longName") or info.get("shortName") or symbol,
         "sector": info.get("sector", "N/A"),
         "industry": info.get("industry", "N/A"),
         "market_cap": info.get("marketCap"),
@@ -601,50 +646,73 @@ def get_fundamentals(symbol: str) -> dict:
         "target_low_price": info.get("targetLowPrice"),
         "number_of_analysts": info.get("numberOfAnalystOpinions"),
     }
+    _cache_set(cache_key, result, _FUNDAMENTAL_TTL)
+    return result
 
 
 def get_balance_sheet(symbol: str) -> dict:
-    ticker = yf.Ticker(symbol)
-    bs = ticker.balance_sheet
-    if bs is None or bs.empty:
+    cache_key = f"bs:{symbol}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        ticker = _get_ticker(symbol)
+        bs = ticker.balance_sheet
+        if bs is None or bs.empty:
+            return {"available": False}
+        latest = bs.iloc[:, 0]
+        result = {
+            "available": True,
+            "date": str(bs.columns[0].date()) if hasattr(bs.columns[0], "date") else str(bs.columns[0]),
+            "total_assets": _safe_val(latest, "Total Assets"),
+            "total_liabilities": _safe_val(latest, "Total Liabilities Net Minority Interest"),
+            "total_equity": _safe_val(latest, "Stockholders Equity"),
+            "cash": _safe_val(latest, "Cash And Cash Equivalents"),
+            "total_debt": _safe_val(latest, "Total Debt"),
+            "net_debt": _safe_val(latest, "Net Debt"),
+            "working_capital": _safe_val(latest, "Working Capital"),
+        }
+        _cache_set(cache_key, result, _FUNDAMENTAL_TTL)
+        return result
+    except Exception as e:
+        logger.warning(f"get_balance_sheet({symbol}) failed: {e}")
         return {"available": False}
-
-    latest = bs.iloc[:, 0]
-    return {
-        "available": True,
-        "date": str(bs.columns[0].date()) if hasattr(bs.columns[0], "date") else str(bs.columns[0]),
-        "total_assets": _safe_val(latest, "Total Assets"),
-        "total_liabilities": _safe_val(latest, "Total Liabilities Net Minority Interest"),
-        "total_equity": _safe_val(latest, "Stockholders Equity"),
-        "cash": _safe_val(latest, "Cash And Cash Equivalents"),
-        "total_debt": _safe_val(latest, "Total Debt"),
-        "net_debt": _safe_val(latest, "Net Debt"),
-        "working_capital": _safe_val(latest, "Working Capital"),
-    }
 
 
 def get_income_statement(symbol: str) -> dict:
-    ticker = yf.Ticker(symbol)
-    inc = ticker.income_stmt
-    if inc is None or inc.empty:
+    cache_key = f"inc:{symbol}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        ticker = _get_ticker(symbol)
+        inc = ticker.income_stmt
+        if inc is None or inc.empty:
+            return {"available": False}
+        latest = inc.iloc[:, 0]
+        result = {
+            "available": True,
+            "date": str(inc.columns[0].date()) if hasattr(inc.columns[0], "date") else str(inc.columns[0]),
+            "total_revenue": _safe_val(latest, "Total Revenue"),
+            "gross_profit": _safe_val(latest, "Gross Profit"),
+            "operating_income": _safe_val(latest, "Operating Income"),
+            "net_income": _safe_val(latest, "Net Income"),
+            "ebitda": _safe_val(latest, "EBITDA"),
+        }
+        _cache_set(cache_key, result, _FUNDAMENTAL_TTL)
+        return result
+    except Exception as e:
+        logger.warning(f"get_income_statement({symbol}) failed: {e}")
         return {"available": False}
-
-    latest = inc.iloc[:, 0]
-    return {
-        "available": True,
-        "date": str(inc.columns[0].date()) if hasattr(inc.columns[0], "date") else str(inc.columns[0]),
-        "total_revenue": _safe_val(latest, "Total Revenue"),
-        "gross_profit": _safe_val(latest, "Gross Profit"),
-        "operating_income": _safe_val(latest, "Operating Income"),
-        "net_income": _safe_val(latest, "Net Income"),
-        "ebitda": _safe_val(latest, "EBITDA"),
-    }
 
 
 def get_earnings_dates(symbol: str) -> list[dict]:
-    """Get upcoming and recent earnings dates."""
-    ticker = yf.Ticker(symbol)
+    cache_key = f"earn:{symbol}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
+        ticker = _get_ticker(symbol)
         cal = ticker.earnings_dates
         if cal is None or cal.empty:
             return []
@@ -656,26 +724,34 @@ def get_earnings_dates(symbol: str) -> list[dict]:
                 "reported_eps": _safe_series_val(row, "Reported EPS"),
                 "surprise_pct": _safe_series_val(row, "Surprise(%)"),
             })
+        _cache_set(cache_key, results, _FUNDAMENTAL_TTL)
         return results
-    except Exception:
+    except Exception as e:
+        logger.warning(f"get_earnings_dates({symbol}) failed: {e}")
         return []
 
 
 def get_news(symbol: str) -> list[dict]:
-    """Fetch recent news for a stock via yfinance and RSS."""
-    ticker = yf.Ticker(symbol)
-    articles = []
+    cache_key = f"news:{symbol}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
 
-    yf_news = getattr(ticker, "news", None)
-    if yf_news:
-        for item in yf_news[:10]:
-            articles.append({
-                "title": item.get("title", ""),
-                "publisher": item.get("publisher", ""),
-                "link": item.get("link", ""),
-                "published": item.get("providerPublishTime", ""),
-                "source": "yfinance",
-            })
+    articles = []
+    try:
+        ticker = _get_ticker(symbol)
+        yf_news = getattr(ticker, "news", None)
+        if yf_news:
+            for item in yf_news[:10]:
+                articles.append({
+                    "title": item.get("title", ""),
+                    "publisher": item.get("publisher", ""),
+                    "link": item.get("link", ""),
+                    "published": item.get("providerPublishTime", ""),
+                    "source": "yfinance",
+                })
+    except Exception as e:
+        logger.warning(f"get_news yfinance({symbol}) failed: {e}")
 
     clean_symbol = symbol.replace(".NS", "").replace(".BO", "")
     try:
@@ -693,7 +769,9 @@ def get_news(symbol: str) -> list[dict]:
     except Exception:
         pass
 
-    return articles[:15]
+    result = articles[:15]
+    _cache_set(cache_key, result, _NEWS_TTL)
+    return result
 
 
 def _safe_val(series: pd.Series, key: str) -> Optional[float]:

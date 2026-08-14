@@ -680,6 +680,142 @@ html, body {
   margin-top: 3px;
 }
 
+/* ===== Pump & Dump Warning ===== */
+.pump-dump-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+  background: linear-gradient(135deg, #3b1111, #450a0a);
+  border: 1px solid #7f1d1d;
+  border-radius: 10px;
+}
+
+.pd-icon {
+  font-size: 22px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.pd-title {
+  font-size: 12px;
+  font-weight: 800;
+  color: #fca5a5;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.pd-level {
+  font-size: 11px;
+  font-weight: 700;
+  margin-top: 2px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  display: inline-block;
+}
+
+.pd-level.high { background: #991b1b; color: #fecaca; }
+.pd-level.medium { background: #92400e; color: #fde68a; }
+.pd-level.low { background: #1e3a5f; color: #93c5fd; }
+
+.pd-reasons {
+  margin-top: 6px;
+  font-size: 11px;
+  color: #d1d4dc;
+  line-height: 1.6;
+}
+
+/* ===== Momentum Trend ===== */
+.score-trend-container {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.trend-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.trend-direction {
+  font-size: 12px;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.trend-direction.strengthening { background: rgba(22,163,74,0.2); color: #4ade80; }
+.trend-direction.weakening { background: rgba(220,38,38,0.2); color: #fca5a5; }
+.trend-direction.stable { background: rgba(245,197,66,0.2); color: #f5c542; }
+
+.trend-score {
+  font-size: 22px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+
+.trend-score.positive { color: #4ade80; }
+.trend-score.negative { color: #f87171; }
+.trend-score.neutral { color: #f5c542; }
+
+.trend-badges {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.trend-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.trend-badge.momentum-shift {
+  background: rgba(124,58,237,0.2);
+  color: #c4b5fd;
+  border: 1px solid rgba(124,58,237,0.4);
+}
+
+.trend-badge.volume-surge {
+  background: rgba(22,163,74,0.2);
+  color: #4ade80;
+  border: 1px solid rgba(22,163,74,0.4);
+}
+
+.trend-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 48px;
+  padding: 4px 0;
+}
+
+.trend-bar {
+  flex: 1;
+  min-width: 0;
+  border-radius: 2px 2px 0 0;
+  position: relative;
+  transition: height 0.3s ease;
+}
+
+.trend-bar.positive { background: var(--green); }
+.trend-bar.negative { background: var(--red); }
+.trend-bar.neutral-bar { background: var(--text-muted); }
+
+.trend-bar.surge {
+  box-shadow: 0 0 4px rgba(22,163,74,0.6);
+}
+
+.trend-bar.sell-surge {
+  box-shadow: 0 0 4px rgba(220,38,38,0.6);
+}
+
 /* ===== Utility ===== */
 .hidden { display: none !important; }
 
