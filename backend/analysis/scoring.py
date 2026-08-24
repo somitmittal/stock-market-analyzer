@@ -20,17 +20,30 @@ def generate_signals(
     Returns current recommendation, historical signals, score trend, and reasoning.
     """
     tech_score = _score_technical(technical)
-    fund_score = fundamental_analysis.get("overall_score", 50)
-    earnings_modifier = _score_earnings_proximity(earnings)
-    news_modifier = _score_news_sentiment(news)
-
-    # Weighted composite: technicals 50%, fundamentals 30%, earnings 10%, news 10%
-    composite = (
-        tech_score["score"] * 0.50
-        + fund_score * 0.30
-        + earnings_modifier * 0.10
-        + news_modifier * 0.10
+    fund_available = any(
+        fundamental_analysis.get(section, {}).get("score") is not None
+        for section in (
+            "valuation",
+            "profitability",
+            "growth",
+            "financial_health",
+            "analyst_sentiment",
+        )
     )
+    fund_score = fundamental_analysis.get("overall_score") if fund_available else None
+    earnings_modifier = _score_earnings_proximity(earnings) if earnings else None
+    news_modifier = _score_news_sentiment(news) if news else None
+
+    # Missing evidence is excluded instead of being silently treated as neutral.
+    weighted_scores = [(tech_score["score"], 0.50)]
+    if fund_score is not None:
+        weighted_scores.append((fund_score, 0.30))
+    if earnings_modifier is not None:
+        weighted_scores.append((earnings_modifier, 0.10))
+    if news_modifier is not None:
+        weighted_scores.append((news_modifier, 0.10))
+    total_weight = sum(weight for _, weight in weighted_scores)
+    composite = sum(score * weight for score, weight in weighted_scores) / total_weight
 
     entry_probability = min(95, max(5, composite))
     exit_probability = min(95, max(5, 100 - composite))
@@ -54,8 +67,13 @@ def generate_signals(
         composite = min(composite, 55)
         entry_probability = min(55, entry_probability)
 
-    action = _determine_action(entry_probability, tech_score, fundamental_analysis,
-                               pump_dump_detected=pump_dump["detected"])
+    action = _determine_action(
+        entry_probability,
+        tech_score,
+        fundamental_analysis,
+        pump_dump_detected=pump_dump["detected"],
+        fundamentals_available=fund_available,
+    )
 
     historical_signals = _generate_historical_signals(df, technical)
 
@@ -76,10 +94,19 @@ def generate_signals(
         "risk_reward_ratio": round(risk_reward, 2),
         "score_breakdown": {
             "technical": round(tech_score["score"], 1),
-            "fundamental": round(fund_score, 1),
-            "earnings_proximity": round(earnings_modifier, 1),
-            "news_sentiment": round(news_modifier, 1),
+            "fundamental": round(fund_score, 1) if fund_score is not None else None,
+            "earnings_proximity": (
+                round(earnings_modifier, 1) if earnings_modifier is not None else None
+            ),
+            "news_sentiment": (
+                round(news_modifier, 1) if news_modifier is not None else None
+            ),
             "composite": round(composite, 1),
+        },
+        "score_coverage": {
+            "fundamentals": fund_available,
+            "earnings": bool(earnings),
+            "news": bool(news),
         },
         "technical_signals": tech_score["signals"],
         "historical_signals": historical_signals,
@@ -328,7 +355,8 @@ def _calculate_stop_loss(entry_price: float, technical: dict, sr: dict, atr: flo
 
 
 def _determine_action(probability: float, tech_score: dict, fund_analysis: dict,
-                      pump_dump_detected: bool = False) -> str:
+                      pump_dump_detected: bool = False,
+                      fundamentals_available: bool = True) -> str:
     """
     STRONG BUY requires ALL of:
       1. Composite score >= 80
@@ -353,12 +381,15 @@ def _determine_action(probability: float, tech_score: dict, fund_analysis: dict,
     # STRONG BUY: very high bar — multiple confirmations required
     if (probability >= 80
             and tech_val >= 75
+            and fundamentals_available
             and fund_score >= 45
             and bullish_signal_count >= 4):
         return "STRONG BUY"
 
     # BUY: solid confluence
     if probability >= 68 and tech_val >= 60:
+        if not fundamentals_available:
+            return "LEAN BUY"
         if fund_signal in ("strong_buy", "buy") or fund_score >= 55:
             return "BUY"
         return "LEAN BUY"

@@ -10,6 +10,8 @@ from fastapi.responses import FileResponse
 from pathlib import Path
 import traceback
 import math
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 
 from data.fetcher import (
@@ -17,8 +19,13 @@ from data.fetcher import (
     get_income_statement, get_earnings_dates, get_news,
     resolve_indian_symbol, search_nse_symbols,
 )
+from data.indian_api import fetch_company_research, fetch_ipo_data
+from data.disclosures import fetch_recent_disclosures
 from analysis.technical import compute_all_indicators
 from analysis.fundamental import analyze_fundamentals
+from analysis.research import analyze_company_research
+from analysis.documents import analyze_offer_document
+from analysis.sector_rotation import analyze_sector_rotation
 from analysis.scoring import generate_signals
 
 app = FastAPI(
@@ -44,7 +51,7 @@ async def health():
 
 
 @app.get("/api/search")
-async def search_stocks(
+def search_stocks(
     q: str = Query("", description="Search query"),
     exchange: str = Query("NSE", description="Exchange: NSE or BSE"),
     limit: int = Query(15),
@@ -63,7 +70,7 @@ async def search_stocks(
 
 
 @app.get("/api/chart/{symbol}")
-async def chart_data(
+def chart_data(
     symbol: str,
     exchange: str = Query("NSE"),
 ):
@@ -88,7 +95,7 @@ async def chart_data(
 
 
 @app.get("/api/analyze/{symbol}")
-async def analyze_stock(
+def analyze_stock(
     symbol: str,
     exchange: str = Query("NSE"),
     interval: str = Query("1d", description="Candle interval: 1d, 1wk, 1mo"),
@@ -103,12 +110,25 @@ async def analyze_stock(
         df = get_stock_data(symbol, period="max", interval=interval)
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
 
-        # Non-critical calls — each silently returns defaults on failure
-        fundamentals = get_fundamentals(symbol)
-        balance_sheet = get_balance_sheet(symbol)
-        income_stmt = get_income_statement(symbol)
-        earnings = get_earnings_dates(symbol)
-        news = get_news(symbol)
+        # Historical chart data remains Yahoo-backed because IndianAPI's
+        # history endpoint does not provide full OHLC candles.
+        inputs = _fetch_analysis_inputs(symbol)
+        fundamentals = inputs["fundamentals"]
+        balance_sheet = inputs["balance_sheet"]
+        income_stmt = inputs["income_statement"]
+        earnings = inputs["earnings"]
+        news = inputs["news"]
+        indian_api = inputs["indian_api"]
+        disclosures = inputs["disclosures"]
+        snapshot = indian_api.get("snapshot") or {}
+        sector_rotation = analyze_sector_rotation(snapshot.get("industry"))
+        research = analyze_company_research(
+            snapshot,
+            indian_api.get("historical_stats") or {},
+            indian_api.get("market_history") or {},
+            disclosures,
+            sector_rotation,
+        )
 
         technical = compute_all_indicators(df)
         fund_analysis = analyze_fundamentals(fundamentals, balance_sheet, income_stmt)
@@ -126,10 +146,25 @@ async def analyze_stock(
         chart_markers = _build_chart_markers(df, signals.get("historical_signals", []))
         sma_lines = _build_sma_lines(df)
 
+        live_price, live_price_source, live_price_as_of = _indian_api_price(
+            snapshot,
+            exchange,
+            indian_api.get("market_history") or {},
+        )
+        last_bar_as_of = _index_iso(df.index[-1])
+        warnings = _build_data_warnings(indian_api, last_bar_as_of)
+
         return _sanitize({
             "symbol": symbol.upper(),
-            "company_name": fundamentals.get("company_name", symbol),
-            "current_price": round(float(df["Close"].iloc[-1]), 2),
+            "company_name": snapshot.get("companyName") or fundamentals.get("company_name", symbol),
+            "current_price": round(live_price or float(df["Close"].iloc[-1]), 2),
+            "current_price_source": (
+                live_price_source
+                if live_price is not None
+                else "Yahoo Finance historical close"
+            ),
+            "current_price_as_of": live_price_as_of or last_bar_as_of,
+            "analysis_as_of": datetime.now(timezone.utc).isoformat(),
             "interval": interval,
             "chart": {"candles": candles, "volumes": volumes},
             "chart_markers": chart_markers,
@@ -142,6 +177,20 @@ async def analyze_stock(
             "income_statement": income_stmt,
             "earnings": earnings,
             "news": news,
+            "research": research,
+            "data_provenance": {
+                "live_snapshot": indian_api.get("provenance", {}).get("snapshot"),
+                "research": indian_api.get("provenance", {}),
+                "official_filings": disclosures.get("provenance"),
+                "sector_rotation": sector_rotation.get("provenance"),
+                "ohlcv": {
+                    "provider": "Yahoo Finance",
+                    "status": "ok",
+                    "as_of": last_bar_as_of,
+                    "usage": "completed candles for technical indicators",
+                },
+            },
+            "data_warnings": warnings,
         })
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -154,12 +203,23 @@ async def analyze_stock(
 
 
 @app.get("/api/fundamental/{symbol}")
-async def fundamental_only(symbol: str, exchange: str = Query("NSE")):
+def fundamental_only(symbol: str, exchange: str = Query("NSE")):
     try:
         symbol = resolve_indian_symbol(symbol, exchange)
         fundamentals = get_fundamentals(symbol)
         balance_sheet = get_balance_sheet(symbol)
         income_stmt = get_income_statement(symbol)
+        indian_api = fetch_company_research(symbol)
+        disclosures = fetch_recent_disclosures(symbol)
+        snapshot = indian_api.get("snapshot") or {}
+        sector_rotation = analyze_sector_rotation(snapshot.get("industry"))
+        research = analyze_company_research(
+            snapshot,
+            indian_api.get("historical_stats") or {},
+            indian_api.get("market_history") or {},
+            disclosures,
+            sector_rotation,
+        )
         fund_analysis = analyze_fundamentals(fundamentals, balance_sheet, income_stmt)
         return {
             "symbol": symbol.upper(),
@@ -168,19 +228,62 @@ async def fundamental_only(symbol: str, exchange: str = Query("NSE")):
             "fundamentals_raw": fundamentals,
             "balance_sheet": balance_sheet,
             "income_statement": income_stmt,
+            "research": research,
+            "data_provenance": {
+                "indian_api": indian_api.get("provenance", {}),
+                "official_filings": disclosures.get("provenance"),
+                "sector_rotation": sector_rotation.get("provenance"),
+            },
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/news/{symbol}")
-async def news_only(symbol: str, exchange: str = Query("NSE")):
+def news_only(symbol: str, exchange: str = Query("NSE")):
     try:
         symbol = resolve_indian_symbol(symbol, exchange)
         news = get_news(symbol)
         return {"symbol": symbol.upper(), "news": news}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/ipo")
+def ipo_data():
+    """Latest IPO records from IndianAPI; DRHP URLs depend on provider coverage."""
+    result = fetch_ipo_data()
+    return _sanitize(result)
+
+
+@app.get("/api/ipo/{company}/research")
+def ipo_research(company: str):
+    """Locate an IPO document and extract the core DRHP/RHP research sections."""
+    result = fetch_ipo_data()
+    ipo_payload = result.get("data") or {}
+    record = _find_ipo_record(ipo_payload, company)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"No IPO record found for {company}")
+    document_url = record.get("document_url")
+    if not document_url:
+        raise HTTPException(
+            status_code=404,
+            detail=f"IPO record found for {company}, but no offer document URL is available",
+        )
+    try:
+        document_analysis = analyze_offer_document(document_url)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Offer document could not be read: {exc}",
+        )
+    return _sanitize(
+        {
+            "ipo": record,
+            "document_analysis": document_analysis,
+            "data_provenance": result.get("provenance"),
+        }
+    )
 
 
 def _sanitize(obj):
@@ -192,6 +295,83 @@ def _sanitize(obj):
     if isinstance(obj, list):
         return [_sanitize(v) for v in obj]
     return obj
+
+
+def _indian_api_price(
+    snapshot: dict,
+    exchange: str,
+    market_history: dict,
+) -> tuple[float | None, str | None, str | None]:
+    for dataset in market_history.get("datasets") or []:
+        if dataset.get("metric") != "Price" or not dataset.get("values"):
+            continue
+        latest = dataset["values"][-1]
+        try:
+            return float(latest[1]), "IndianAPI market history", str(latest[0])
+        except (IndexError, TypeError, ValueError):
+            break
+    prices = snapshot.get("currentPrice") or {}
+    value = prices.get(exchange.upper())
+    try:
+        if value is None:
+            return None, None, None
+        return float(value), "IndianAPI snapshot", None
+    except (TypeError, ValueError):
+        return None, None, None
+
+
+def _index_iso(value) -> str:
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _build_data_warnings(indian_api: dict, last_bar_as_of: str) -> list[str]:
+    warnings = [
+        "Technical indicators use the latest completed Yahoo Finance candle, not an intraday candle.",
+    ]
+    snapshot_status = (
+        indian_api.get("provenance", {}).get("snapshot", {}).get("status")
+    )
+    if snapshot_status != "ok":
+        warnings.append(
+            "IndianAPI live snapshot is unavailable; displayed price falls back to the latest historical close."
+        )
+    if not indian_api.get("snapshot"):
+        warnings.append("IndianAPI fundamental snapshot is unavailable.")
+    warnings.append(f"Latest technical-analysis candle: {last_bar_as_of}")
+    return warnings
+
+
+def _find_ipo_record(payload: dict, company: str) -> dict | None:
+    query = company.strip().lower()
+    for records in payload.values():
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            name = str(record.get("name", "")).lower()
+            symbol = str(record.get("symbol", "")).lower()
+            if query == symbol or query in name:
+                return record
+    return None
+
+
+def _fetch_analysis_inputs(symbol: str) -> dict:
+    fetchers = {
+        "fundamentals": lambda: get_fundamentals(symbol),
+        "balance_sheet": lambda: get_balance_sheet(symbol),
+        "income_statement": lambda: get_income_statement(symbol),
+        "earnings": lambda: get_earnings_dates(symbol),
+        "news": lambda: get_news(symbol),
+        "indian_api": lambda: fetch_company_research(symbol),
+        "disclosures": lambda: fetch_recent_disclosures(symbol),
+    }
+    with ThreadPoolExecutor(max_workers=len(fetchers)) as executor:
+        futures = {
+            name: executor.submit(fetcher)
+            for name, fetcher in fetchers.items()
+        }
+        return {name: future.result() for name, future in futures.items()}
 
 
 def _build_chart_markers(df: pd.DataFrame, historical_signals: list) -> list:

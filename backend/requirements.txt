@@ -10,3 +10,5 @@ pydantic>=2.9.0
 feedparser>=6.0.0
 beautifulsoup4>=4.12.0
 aiohttp>=3.10.0
+pypdf>=6.0.0
+bse>=3.3.1

@@ -85,6 +85,12 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   });
 
+  // Sidebar close button
+  document.getElementById("sidebarClose").addEventListener("click", () => {
+    sidebar.classList.add("hidden");
+    if (chart) resizeChart();
+  });
+
   // Collapsible sections
   document.querySelectorAll(".toggle-title").forEach((el) => {
     el.addEventListener("click", () => {
@@ -181,6 +187,7 @@ async function runAnalysis(symbolOverride) {
     sidebar.classList.remove("hidden");
     chartLegend.classList.remove("hidden");
     priceDisplay.classList.remove("hidden");
+    setTimeout(() => { if (chart) resizeChart(); }, 50);
 
     const displaySymbol = data.symbol.replace(".NS", " (NSE)").replace(".BO", " (BSE)");
     document.getElementById("priceName").textContent = data.company_name;
@@ -420,6 +427,8 @@ function renderSidebar(data) {
 
   // Score trend
   renderScoreTrend(signals.score_trend);
+  renderDataFreshness(data);
+  renderResearch(data.research);
 
   // Signal banner with colored badge
   const actionEl = document.getElementById("sigAction");
@@ -582,6 +591,14 @@ function renderScoreTrend(trend) {
 // Helpers
 // ──────────────────────────────────────
 function scoreBar(label, value) {
+  if (value == null) {
+    return `
+      <div class="score-row">
+        <span class="score-label">${label}</span>
+        <div class="score-track"></div>
+        <span class="score-number">N/A</span>
+      </div>`;
+  }
   const color = scoreColor(value);
   return `
     <div class="score-row">
@@ -591,6 +608,164 @@ function scoreBar(label, value) {
       </div>
       <span class="score-number">${Math.round(value)}</span>
     </div>`;
+}
+
+function renderDataFreshness(data) {
+  const container = document.getElementById("dataFreshness");
+  const live = data.data_provenance?.live_snapshot || {};
+  const ohlcv = data.data_provenance?.ohlcv || {};
+  const liveOk = live.status === "ok";
+  container.innerHTML = `
+    <div class="freshness-row">
+      <span>Current price</span>
+      <strong class="${liveOk ? "fresh" : "stale"}">${data.current_price_source || "Unknown"}</strong>
+    </div>
+    <div class="freshness-row">
+      <span>Live fetch</span>
+      <strong>${formatDateTime(live.fetched_at)}</strong>
+    </div>
+    <div class="freshness-row">
+      <span>Price as of</span>
+      <strong>${formatDateTime(data.current_price_as_of)}</strong>
+    </div>
+    <div class="freshness-row">
+      <span>TA candle</span>
+      <strong>${formatDateTime(ohlcv.as_of)}</strong>
+    </div>
+    ${(data.data_warnings || []).map((warning) => `<div class="data-warning">${warning}</div>`).join("")}
+  `;
+}
+
+function renderResearch(research) {
+  const container = document.getElementById("researchSection");
+  if (!research?.available) {
+    container.innerHTML = '<div class="fund-signal-item">Structured research data unavailable.</div>';
+    return;
+  }
+
+  const growth = research.growth || {};
+  const cash = research.cash_quality || {};
+  const valuation = research.valuation || {};
+  const ownership = research.ownership || {};
+  const genuineVolume = research.genuine_volume || {};
+  const deterioration = research.fundamental_deterioration || {};
+  const sector = research.sector_context || {};
+  const guidance = research.management_guidance || {};
+  const orderBook = research.order_book || {};
+  const pledging = ownership.pledging || {};
+  const disclosures = research.recent_disclosures || {};
+  const scenarios = research.multibagger_scenarios || [];
+
+  const metrics = [
+    ["Revenue YoY", formatPct(growth.revenue_yoy_pct)],
+    ["Profit YoY", formatPct(growth.profit_yoy_pct)],
+    ["Operating margin", formatPct(growth.operating_margin_latest_pct)],
+    ["PEG", formatNumber(valuation.peg)],
+    ["CFO / profit", formatNumber(cash.cash_profit_conversion)],
+    ["Promoter holding", formatPct(ownership.promoter_holding_latest_pct)],
+    ["Promoter pledge", pledging.available ? "Filing evidence" : "Not found"],
+    ["Sector rotation", sector.status ? formatSignal(sector.status) : "N/A"],
+    ["Sector vs Nifty", formatPct(sector.relative_strength_pct)],
+    ["Volume / recent avg", formatMultiple(genuineVolume.volume_vs_recent_average)],
+    ["Delivery", formatPct(genuineVolume.delivery_pct)],
+  ];
+
+  container.innerHTML = `
+    <div class="research-grid">
+      ${metrics.map(([label, value]) => `
+        <div class="research-metric">
+          <span>${label}</span>
+          <strong>${value}</strong>
+        </div>`).join("")}
+    </div>
+    ${deterioration.detected ? `
+      <div class="research-alert">
+        <strong>Fundamental deterioration</strong>
+        ${deterioration.flags.map((flag) => `<div>• ${flag}</div>`).join("")}
+      </div>` : '<div class="research-ok">No measured deterioration flags.</div>'}
+    <div class="scenario-title">Required CAGR scenarios</div>
+    <div class="scenario-list">
+      ${scenarios.map((scenario) => `
+        <span>${scenario.multiple} in ${scenario.years}y: <strong>${scenario.required_cagr_pct}%</strong></span>
+      `).join("")}
+    </div>
+    ${renderFilingEvidence("Management guidance", guidance)}
+    ${renderFilingEvidence("Order book", orderBook)}
+    ${renderFilingEvidence("Promoter pledging", pledging)}
+    ${renderDisclosureLinks(disclosures)}
+    <div class="research-note">${genuineVolume.interpretation || ""}</div>
+    <div class="research-note">${sector.method || sector.note || ""}</div>
+    <div class="research-note">${research.moat_evidence?.note || ""}</div>
+  `;
+}
+
+function renderFilingEvidence(title, evidence) {
+  if (!evidence?.available) {
+    return `<div class="filing-evidence unavailable"><strong>${title}</strong><span>No extractable evidence in the filing window.</span></div>`;
+  }
+  const excerpt = evidence.excerpts?.[0] || "Relevant filing found.";
+  const source = evidence.source || {};
+  const sourceLink = source.attachment_url
+    ? `<a href="${escapeHtml(source.attachment_url)}" target="_blank" rel="noopener">Open BSE filing</a>`
+    : "";
+  return `
+    <div class="filing-evidence">
+      <strong>${title}</strong>
+      <span>${escapeHtml(excerpt)}</span>
+      <div class="filing-source">${escapeHtml(source.date || "")} ${sourceLink}</div>
+    </div>`;
+}
+
+function renderDisclosureLinks(disclosures) {
+  if (!disclosures?.available) return "";
+  const categories = disclosures.categories || {};
+  const records = [
+    ...(categories.concall || []),
+    ...(categories.management_guidance || []),
+    ...(categories.order_book || []),
+    ...(categories.shareholding || []),
+  ];
+  const seen = new Set();
+  const unique = records.filter((record) => {
+    if (!record.id || seen.has(record.id)) return false;
+    seen.add(record.id);
+    return true;
+  });
+  return `
+    <div class="disclosure-list">
+      <div class="scenario-title">Official filings (${disclosures.filing_window?.from || "—"} to ${disclosures.filing_window?.to || "—"})</div>
+      ${unique.length ? unique.map((record) => `
+        <a href="${escapeHtml(record.attachment_url || record.company_url || "#")}" target="_blank" rel="noopener">
+          ${escapeHtml(record.subject || record.headline || "BSE disclosure")}
+        </a>`).join("") : '<span>No relevant filings classified.</span>'}
+    </div>`;
+}
+
+function formatDateTime(value) {
+  if (!value) return "Unavailable";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("en-IN");
+}
+
+function formatPct(value) {
+  return value == null ? "N/A" : `${Number(value).toFixed(1)}%`;
+}
+
+function formatNumber(value) {
+  return value == null ? "N/A" : Number(value).toFixed(2);
+}
+
+function formatMultiple(value) {
+  return value == null ? "N/A" : `${Number(value).toFixed(2)}x`;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
 function scoreColor(val) {

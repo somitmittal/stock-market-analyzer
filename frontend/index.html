@@ -88,6 +88,7 @@
 
       <!-- Sidebar -->
       <aside id="sidebar" class="hidden">
+        <button id="sidebarClose" class="sidebar-close" title="Close sidebar">&times;</button>
         <div class="sidebar-scroll">
           <!-- Signal Banner -->
           <section class="sidebar-section signal-banner-section">
@@ -101,6 +102,12 @@
                 <div class="confidence-label">confidence</div>
               </div>
             </div>
+          </section>
+
+          <!-- Data Freshness -->
+          <section class="sidebar-section">
+            <h3 class="section-title">Data Freshness</h3>
+            <div id="dataFreshness" class="data-freshness"></div>
           </section>
 
           <!-- Pump & Dump Warning -->
@@ -182,6 +189,12 @@
               <div id="fundScoreDisplay" class="fund-score-display"></div>
               <div id="fundSignals" class="fund-signals"></div>
             </div>
+          </section>
+
+          <!-- Deep Research -->
+          <section class="sidebar-section">
+            <h3 class="section-title toggle-title" data-target="researchSection">Business Research <span class="toggle-arrow">▾</span></h3>
+            <div id="researchSection" class="research-section"></div>
           </section>
 
           <!-- News -->
