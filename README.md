@@ -109,11 +109,21 @@ curl "http://localhost:8899/api/analyze/RELIANCE?exchange=NSE&interval=1d"
 
 ## Data Sources and Provenance
 
-- IndianAPI supplies current price, quarterly financials, cash flow, balance sheet, ratios, and shareholding history.
-- Yahoo Finance supplies historical OHLCV candles and NSE sector-index history.
+- IndianAPI supplies current price, quarterly financials, cash flow, balance sheet, ratios, shareholding history, and daily close/volume used to build charts on Render.
+- Yahoo Finance is optional local fallback for true OHLC candles and NSE sector-index history. It is disabled on Render because Yahoo rate-limits shared cloud IPs.
 - BSE India supplies official corporate-announcement metadata and source PDF attachments. The public JSON endpoint is undocumented, so the app reports failures instead of silently substituting unofficial filing data.
-- Screener and MarketMojo are not scraped. They do not provide supported public APIs; sector rotation is computed transparently from index returns instead.
+- Screener and MarketMojo are not scraped. They do not provide supported public APIs; sector rotation is computed from index returns when Yahoo is available.
 - Promoter pledging, guidance, and order-book claims are shown only when matching text is extractable from an official filing. Missing evidence remains marked unavailable.
+
+## Render
+
+The service `stock-market-analyzer` deploys from this repo via `render.yaml`.
+
+1. Set `INDIAN_API_KEY` in the Render dashboard (the blueprint marks it as a secret).
+2. Leave `DISABLE_YFINANCE=true`. Do not re-enable Yahoo on the free Render plan.
+3. Push `main` to GitHub to trigger a deploy.
+
+Charts on Render use IndianAPI close+volume. Open/high/low are derived, so candlestick-pattern confidence is weaker than a true OHLC feed.
 
 ## Stock Symbol Format
 

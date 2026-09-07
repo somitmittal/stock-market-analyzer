@@ -7,11 +7,14 @@ import os
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import requests
 
 
 DEFAULT_BASE_URL = "https://stock.indianapi.in"
 REQUEST_TIMEOUT_SECONDS = 15
+# Documented IndianAPI history windows. Daily TA needs ~200 bars for EMA200.
+PERIOD_BY_INTERVAL = {"1d": "5yr", "1wk": "10yr", "1mo": "max"}
 
 
 def _load_local_env() -> None:
@@ -58,6 +61,81 @@ def fetch_historical_market_data(symbol: str, period: str = "1yr") -> dict[str, 
         "/historical_data",
         params={"stock_name": _clean_symbol(symbol), "period": period, "filter": "price"},
     )
+
+
+def history_to_ohlcv(market_history: dict[str, Any] | None, interval: str = "1d") -> pd.DataFrame:
+    """Build OHLC bars from IndianAPI close+volume series.
+
+    IndianAPI does not publish true high/low. Open is the prior close; high/low
+    are the max/min of that open and close so indicators still have a range.
+    """
+    datasets = (market_history or {}).get("datasets") or []
+    prices = _dataset_map(datasets, "Price")
+    volumes = _dataset_map(datasets, "Volume")
+    if not prices:
+        return pd.DataFrame()
+
+    rows = []
+    previous_close: float | None = None
+    for date_key in sorted(prices):
+        close = prices[date_key]
+        if close is None:
+            continue
+        open_price = previous_close if previous_close is not None else close
+        high = max(open_price, close)
+        low = min(open_price, close)
+        volume = volumes.get(date_key) or 0.0
+        rows.append(
+            {
+                "Date": pd.Timestamp(date_key),
+                "Open": open_price,
+                "High": high,
+                "Low": low,
+                "Close": close,
+                "Volume": volume,
+            }
+        )
+        previous_close = close
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows).set_index("Date")
+    if interval == "1wk":
+        df = _resample_ohlcv(df, "W-FRI")
+    elif interval == "1mo":
+        df = _resample_ohlcv(df, "ME")
+    df.attrs["ohlcv_provider"] = "IndianAPI"
+    df.attrs["synthetic_ohlc"] = True
+    return df
+
+
+def _dataset_map(datasets: list[dict[str, Any]], metric: str) -> dict[str, float]:
+    dataset = next((item for item in datasets if item.get("metric") == metric), None)
+    if not dataset:
+        return {}
+    mapped: dict[str, float] = {}
+    for item in dataset.get("values") or []:
+        if not item:
+            continue
+        try:
+            mapped[str(item[0])] = float(item[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+    return mapped
+
+
+def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    resampled = df.resample(rule).agg(
+        {
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum",
+        }
+    )
+    return resampled.dropna(subset=["Open", "High", "Low", "Close"])
 
 
 def fetch_ipo_data() -> dict[str, Any]:

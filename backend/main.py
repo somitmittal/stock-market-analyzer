@@ -77,7 +77,7 @@ def chart_data(
     """OHLCV daily candlestick data formatted for Lightweight Charts."""
     try:
         symbol = resolve_indian_symbol(symbol, exchange)
-        df = get_stock_data(symbol, period="max", interval="1d")
+        df = get_stock_data(symbol, period="5y", interval="1d")
         candles = []
         volumes = []
         for idx, row in df.iterrows():
@@ -106,12 +106,9 @@ def analyze_stock(
     try:
         symbol = resolve_indian_symbol(symbol, exchange)
 
-        # CRITICAL: OHLCV is the only required call — everything else degrades gracefully
-        df = get_stock_data(symbol, period="max", interval=interval)
+        # Charts prefer IndianAPI close+volume. Yahoo is only a fallback off Render.
+        df = get_stock_data(symbol, period="5y", interval=interval)
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
-
-        # Historical chart data remains Yahoo-backed because IndianAPI's
-        # history endpoint does not provide full OHLC candles.
         inputs = _fetch_analysis_inputs(symbol)
         fundamentals = inputs["fundamentals"]
         balance_sheet = inputs["balance_sheet"]
@@ -152,7 +149,9 @@ def analyze_stock(
             indian_api.get("market_history") or {},
         )
         last_bar_as_of = _index_iso(df.index[-1])
-        warnings = _build_data_warnings(indian_api, last_bar_as_of)
+        ohlcv_provider = df.attrs.get("ohlcv_provider") or "Unknown"
+        synthetic_ohlc = bool(df.attrs.get("synthetic_ohlc"))
+        warnings = _build_data_warnings(indian_api, last_bar_as_of, ohlcv_provider, synthetic_ohlc)
 
         return _sanitize({
             "symbol": symbol.upper(),
@@ -161,7 +160,7 @@ def analyze_stock(
             "current_price_source": (
                 live_price_source
                 if live_price is not None
-                else "Yahoo Finance historical close"
+                else f"{ohlcv_provider} historical close"
             ),
             "current_price_as_of": live_price_as_of or last_bar_as_of,
             "analysis_as_of": datetime.now(timezone.utc).isoformat(),
@@ -184,9 +183,10 @@ def analyze_stock(
                 "official_filings": disclosures.get("provenance"),
                 "sector_rotation": sector_rotation.get("provenance"),
                 "ohlcv": {
-                    "provider": "Yahoo Finance",
+                    "provider": ohlcv_provider,
                     "status": "ok",
                     "as_of": last_bar_as_of,
+                    "synthetic_ohlc": synthetic_ohlc,
                     "usage": "completed candles for technical indicators",
                 },
             },
@@ -326,10 +326,19 @@ def _index_iso(value) -> str:
     return str(value)
 
 
-def _build_data_warnings(indian_api: dict, last_bar_as_of: str) -> list[str]:
+def _build_data_warnings(
+    indian_api: dict,
+    last_bar_as_of: str,
+    ohlcv_provider: str,
+    synthetic_ohlc: bool,
+) -> list[str]:
     warnings = [
-        "Technical indicators use the latest completed Yahoo Finance candle, not an intraday candle.",
+        f"Technical indicators use completed {ohlcv_provider} candles, not an intraday candle.",
     ]
+    if synthetic_ohlc:
+        warnings.append(
+            "IndianAPI history is close and volume only. Open/high/low are derived from consecutive closes, so candlestick patterns and ATR are approximate."
+        )
     snapshot_status = (
         indian_api.get("provenance", {}).get("snapshot", {}).get("status")
     )

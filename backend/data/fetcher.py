@@ -44,8 +44,24 @@ def _cache_set(key: str, val: any, ttl: int):
     with _cache_lock:
         _cache[key] = {"val": val, "ts": time.time(), "ttl": ttl}
 
+def yfinance_enabled() -> bool:
+    """Yahoo is blocked on Render shared IPs. Keep it off there unless explicitly enabled."""
+    flag = os.getenv("DISABLE_YFINANCE", "").strip().lower()
+    if flag in ("1", "true", "yes"):
+        return False
+    if os.getenv("RENDER") and os.getenv("ENABLE_YFINANCE", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return False
+    return True
+
+
 def _get_ticker(symbol: str) -> yf.Ticker:
     """Get or create a cached Ticker instance (avoids re-creating HTTP sessions)."""
+    if not yfinance_enabled():
+        raise RuntimeError("Yahoo Finance is disabled")
     key = f"_ticker:{symbol}"
     cached = _cache_get(key)
     if cached is not None:
@@ -69,12 +85,54 @@ def get_stock_data(symbol: str, period: str = "1y", interval: str = "1d") -> pd.
     if cached is not None:
         return cached
 
-    ticker = _get_ticker(symbol)
-    df = ticker.history(period=period, interval=interval)
-    if df.empty:
-        raise ValueError(f"No data found for {symbol}. Check the symbol — for NSE use symbols like RELIANCE, TCS, INFY.")
-    _cache_set(cache_key, df, _OHLCV_TTL)
-    return df
+    last_error = None
+    if not symbol.startswith("^"):
+        df = _ohlcv_from_indian_api(symbol, interval)
+        if df is not None and not df.empty:
+            _cache_set(cache_key, df, _OHLCV_TTL)
+            return df
+
+    if yfinance_enabled():
+        try:
+            ticker = _get_ticker(symbol)
+            df = ticker.history(period=period, interval=interval)
+            if not df.empty:
+                df.attrs["ohlcv_provider"] = "Yahoo Finance"
+                df.attrs["synthetic_ohlc"] = False
+                _cache_set(cache_key, df, _OHLCV_TTL)
+                return df
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Yahoo OHLCV failed for %s: %s", symbol, exc)
+
+    detail = f" ({last_error})" if last_error else ""
+    raise ValueError(
+        f"No chart data found for {symbol}.{detail} "
+        "Check the symbol — for NSE use names like RELIANCE, TCS, INFY."
+    )
+
+
+def _ohlcv_from_indian_api(symbol: str, interval: str) -> pd.DataFrame | None:
+    from data.indian_api import (
+        PERIOD_BY_INTERVAL,
+        fetch_historical_market_data,
+        history_to_ohlcv,
+        is_configured,
+    )
+
+    if not is_configured():
+        return None
+    api_period = PERIOD_BY_INTERVAL.get(interval, "5yr")
+    result = fetch_historical_market_data(symbol, period=api_period)
+    if result.get("provenance", {}).get("status") != "ok":
+        logger.warning(
+            "IndianAPI history unavailable for %s: %s",
+            symbol,
+            result.get("provenance"),
+        )
+        return None
+    df = history_to_ohlcv(result.get("data") or {}, interval=interval)
+    return df if not df.empty else None
 
 
 def search_nse_symbols(query: str, limit: int = 15) -> list[dict]:
@@ -95,8 +153,8 @@ def search_nse_symbols(query: str, limit: int = 15) -> list[dict]:
     # Layer 1: Local search (fast, supports sector tags)
     local_results = _search_local(query_upper, query_words)
 
-    # Layer 2: Yahoo Finance live search (covers all listed stocks)
-    live_results = _search_yfinance_live(raw_query, query_words)
+    # Layer 2: Yahoo Finance live search — skipped on Render (shared-IP 429s)
+    live_results = _search_yfinance_live(raw_query, query_words) if yfinance_enabled() else []
 
     # Merge: local first, then live (deduplicate by symbol)
     seen = set()
@@ -601,6 +659,8 @@ def _get_fallback_symbols() -> list[dict]:
 
 
 def get_fundamentals(symbol: str) -> dict:
+    if not yfinance_enabled():
+        return {"company_name": symbol}
     cache_key = f"fund:{symbol}"
     cached = _cache_get(cache_key)
     if cached is not None:
@@ -651,6 +711,8 @@ def get_fundamentals(symbol: str) -> dict:
 
 
 def get_balance_sheet(symbol: str) -> dict:
+    if not yfinance_enabled():
+        return {"available": False}
     cache_key = f"bs:{symbol}"
     cached = _cache_get(cache_key)
     if cached is not None:
@@ -680,6 +742,8 @@ def get_balance_sheet(symbol: str) -> dict:
 
 
 def get_income_statement(symbol: str) -> dict:
+    if not yfinance_enabled():
+        return {"available": False}
     cache_key = f"inc:{symbol}"
     cached = _cache_get(cache_key)
     if cached is not None:
@@ -707,6 +771,8 @@ def get_income_statement(symbol: str) -> dict:
 
 
 def get_earnings_dates(symbol: str) -> list[dict]:
+    if not yfinance_enabled():
+        return []
     cache_key = f"earn:{symbol}"
     cached = _cache_get(cache_key)
     if cached is not None:
@@ -738,20 +804,21 @@ def get_news(symbol: str) -> list[dict]:
         return cached
 
     articles = []
-    try:
-        ticker = _get_ticker(symbol)
-        yf_news = getattr(ticker, "news", None)
-        if yf_news:
-            for item in yf_news[:10]:
-                articles.append({
-                    "title": item.get("title", ""),
-                    "publisher": item.get("publisher", ""),
-                    "link": item.get("link", ""),
-                    "published": item.get("providerPublishTime", ""),
-                    "source": "yfinance",
-                })
-    except Exception as e:
-        logger.warning(f"get_news yfinance({symbol}) failed: {e}")
+    if yfinance_enabled():
+        try:
+            ticker = _get_ticker(symbol)
+            yf_news = getattr(ticker, "news", None)
+            if yf_news:
+                for item in yf_news[:10]:
+                    articles.append({
+                        "title": item.get("title", ""),
+                        "publisher": item.get("publisher", ""),
+                        "link": item.get("link", ""),
+                        "published": item.get("providerPublishTime", ""),
+                        "source": "yfinance",
+                    })
+        except Exception as e:
+            logger.warning(f"get_news yfinance({symbol}) failed: {e}")
 
     clean_symbol = symbol.replace(".NS", "").replace(".BO", "")
     try:

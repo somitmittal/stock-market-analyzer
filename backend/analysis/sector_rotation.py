@@ -67,7 +67,7 @@ def analyze_sector_rotation(industry: str | None) -> dict[str, Any]:
         benchmark_prices = get_stock_data(BENCHMARK["symbol"], period="3mo", interval="1d")
         sector_return = _period_return(sector_prices["Close"])
         benchmark_return = _period_return(benchmark_prices["Close"])
-    except (ValueError, KeyError) as exc:
+    except (ValueError, KeyError, Exception) as exc:
         return {
             "available": False,
             "industry": industry,
