@@ -14,6 +14,8 @@ services:
       # Yahoo works on Render; IndianAPI remains primary for research/analyze.
       - key: DISABLE_YFINANCE
         value: "false"
+      - key: ENABLE_YFINANCE
+        value: "true"
       - key: INDIAN_API_BASE_URL
         value: https://stock.indianapi.in
       - key: INDIAN_API_KEY
