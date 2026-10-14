@@ -259,6 +259,160 @@ def _moat_evidence(
     }
 
 
+def yahoo_snapshot_fields(fundamentals: dict[str, Any] | None) -> dict[str, Any]:
+    """Minimal snapshot fields Yahoo can supply when IndianAPI is down."""
+    fundamentals = fundamentals or {}
+    industry = fundamentals.get("industry")
+    if industry in (None, "", "N/A"):
+        industry = fundamentals.get("sector")
+    return {
+        "companyName": fundamentals.get("company_name"),
+        "industry": industry if industry not in (None, "", "N/A") else None,
+        "yearHigh": fundamentals.get("52_week_high"),
+        "yearLow": fundamentals.get("52_week_low"),
+    }
+
+
+def merge_yahoo_fundamentals(
+    research: dict[str, Any],
+    fundamentals: dict[str, Any] | None,
+    balance_sheet: dict[str, Any] | None = None,
+    income_statement: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Fill empty research pillars from Yahoo Finance. IndianAPI values win when present."""
+    fundamentals = fundamentals or {}
+    balance_sheet = balance_sheet or {}
+    income_statement = income_statement or {}
+    merged = dict(research)
+    filled_any = False
+
+    profile = dict(merged.get("company_profile") or {})
+    yahoo_profile = yahoo_snapshot_fields(fundamentals)
+    if not profile.get("name") and yahoo_profile.get("companyName"):
+        profile["name"] = yahoo_profile["companyName"]
+        filled_any = True
+    if not profile.get("industry") and yahoo_profile.get("industry"):
+        profile["industry"] = yahoo_profile["industry"]
+        filled_any = True
+    merged["company_profile"] = profile
+
+    growth = merged.get("growth") or {}
+    if not growth.get("available"):
+        revenue_yoy = _as_percent(fundamentals.get("revenue_growth"))
+        profit_yoy = _as_percent(fundamentals.get("earnings_growth"))
+        if revenue_yoy is not None or profit_yoy is not None:
+            merged["growth"] = {
+                "available": True,
+                "revenue_yoy_pct": revenue_yoy,
+                "profit_yoy_pct": profit_yoy,
+                "operating_margin_latest_pct": _as_percent(fundamentals.get("operating_margin")),
+                "operating_margin_yoy_change_pp": None,
+                "latest_period": "TTM (Yahoo Finance)",
+                "source": "yahoo_finance",
+            }
+            filled_any = True
+
+    valuation = merged.get("valuation") or {}
+    if not valuation.get("available"):
+        pe = _to_float(fundamentals.get("pe_ratio"))
+        pb = _to_float(fundamentals.get("pb_ratio"))
+        eps_growth = (merged.get("growth") or {}).get("profit_yoy_pct")
+        if eps_growth is None:
+            eps_growth = _as_percent(fundamentals.get("earnings_growth"))
+        peg = pe / eps_growth if pe is not None and eps_growth not in (None, 0) and eps_growth > 0 else None
+        if pe is not None or pb is not None:
+            merged["valuation"] = {
+                "available": True,
+                "pe": pe,
+                "price_to_book": pb,
+                "eps_growth_pct": eps_growth,
+                "peg": peg,
+                "interpretation": "Valuation from Yahoo Finance TTM metrics while IndianAPI was unavailable.",
+                "source": "yahoo_finance",
+            }
+            filled_any = True
+
+    cash = merged.get("cash_quality") or {}
+    if not cash.get("available"):
+        fcf = _to_float(fundamentals.get("free_cash_flow"))
+        if fcf is not None:
+            merged["cash_quality"] = {
+                "available": True,
+                "operating_cash_flow_latest": None,
+                "free_cash_flow_latest": fcf,
+                "cfo_to_operating_profit_latest": None,
+                "cash_profit_conversion": None,
+                "operating_cash_flow_trend": None,
+                "free_cash_flow_trend": None,
+                "source": "yahoo_finance",
+            }
+            filled_any = True
+
+    balance = merged.get("balance_sheet") or {}
+    if not balance.get("available") and balance_sheet.get("available"):
+        merged["balance_sheet"] = {
+            "available": True,
+            "borrowings_latest": _to_float(balance_sheet.get("total_debt")),
+            "borrowings_trend": None,
+            "reserves_latest": _to_float(balance_sheet.get("total_equity")),
+            "reserves_trend": None,
+            "source": "yahoo_finance",
+        }
+        filled_any = True
+
+    efficiency = merged.get("management_efficiency") or {}
+    if not efficiency.get("available"):
+        roe = _as_percent(fundamentals.get("roe"))
+        if roe is not None:
+            merged["management_efficiency"] = {
+                "available": True,
+                "roe_5y_average_pct": None,
+                "return_on_investment_pct": None,
+                "roce_latest_pct": None,
+                "roce_trend": None,
+                "cash_conversion_cycle_latest_days": None,
+                "cash_conversion_cycle_trend": None,
+                "cash_profit_conversion": None,
+                "roe_latest_pct": roe,
+                "source": "yahoo_finance",
+            }
+            filled_any = True
+            moat = dict(merged.get("moat_evidence") or {})
+            evidence = list(moat.get("evidence") or [])
+            evidence.append(f"Latest ROE (Yahoo Finance): {roe:.2f}%")
+            merged["moat_evidence"] = {
+                "available": True,
+                "evidence": evidence,
+                "note": moat.get("note")
+                or "Financial metrics are moat proxies; technology, brand and switching-cost claims require filings.",
+            }
+
+    sections = (
+        merged.get("growth") or {},
+        merged.get("cash_quality") or {},
+        merged.get("balance_sheet") or {},
+        merged.get("management_efficiency") or {},
+        merged.get("ownership") or {},
+        merged.get("valuation") or {},
+    )
+    covered = sum(1 for section in sections if section.get("available"))
+    merged["data_coverage"] = {"available_sections": covered, "total_sections": 6}
+    merged["available"] = covered > 0
+    if filled_any:
+        merged["fundamental_source"] = "yahoo_finance"
+    return merged
+
+
+def _as_percent(value: Any) -> float | None:
+    number = _to_float(value)
+    if number is None:
+        return None
+    # Yahoo growth / ROE / margin fields are typically fractions (0.14 == 14%).
+    if -2 < number < 2:
+        return number * 100
+    return number
+
+
 def _deterioration_flags(*sections: dict[str, Any]) -> list[str]:
     growth, cash_quality, balance_sheet, efficiency, ownership = sections
     flags = []
@@ -436,8 +590,10 @@ def _trend(values: dict[str, Any], lower_is_better: bool = False) -> str:
 
 
 def _to_float(value: Any) -> float | None:
+    if value is None or value == "N/A":
+        return None
     try:
-        return float(value) if value is not None else None
+        return float(value)
     except (TypeError, ValueError):
         return None
 

@@ -7,6 +7,8 @@ from io import BytesIO
 from pathlib import Path
 import re
 import tempfile
+import threading
+import time
 from typing import Any
 
 from bse import BSE
@@ -17,6 +19,9 @@ import requests
 
 ATTACHMENT_BASE_URL = "https://www.bseindia.com/xml-data/corpfiling/AttachLive"
 REQUEST_TIMEOUT_SECONDS = 15
+_DISCLOSURES_TTL = 3600
+_disclosures_cache: dict[str, dict[str, Any]] = {}
+_disclosures_cache_lock = threading.Lock()
 
 DISCLOSURE_KEYWORDS = {
     "concall": (
@@ -76,9 +81,18 @@ EVIDENCE_TERMS = {
 }
 
 
-def fetch_recent_disclosures(symbol: str) -> dict[str, Any]:
+def fetch_recent_disclosures(
+    symbol: str,
+    *,
+    extract_evidence: bool = True,
+) -> dict[str, Any]:
     """Fetch the user-selected three-month filing window from official BSE data."""
     clean_symbol = symbol.upper().replace(".NS", "").replace(".BO", "")
+    cache_key = f"{clean_symbol}:evidence={int(extract_evidence)}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     fetched_at = datetime.now().astimezone().isoformat()
     to_date = datetime.now()
     from_date = to_date - relativedelta(months=3)
@@ -118,9 +132,13 @@ def fetch_recent_disclosures(symbol: str) -> dict[str, Any]:
         category: [record for record in records if category in record["categories"]]
         for category in DISCLOSURE_KEYWORDS
     }
-    analysis = _analyze_latest_category_documents(categorized)
+    analysis = (
+        _analyze_latest_category_documents(categorized)
+        if extract_evidence
+        else _empty_filing_analysis()
+    )
 
-    return {
+    result = {
         "available": bool(records),
         "scrip_code": str(scrip_code),
         "filing_window": {
@@ -139,6 +157,28 @@ def fetch_recent_disclosures(symbol: str) -> dict[str, Any]:
             "note": "Metadata and attachments originate from BSE; the JSON endpoint is not a supported developer API.",
         },
     }
+    if extract_evidence:
+        result["provenance"]["evidence_extraction"] = "full"
+    else:
+        result["provenance"]["evidence_extraction"] = "metadata_only"
+        result["provenance"]["note"] += (
+            " PDF evidence excerpts are skipped on the fast analyze path."
+        )
+    _cache_set(cache_key, result)
+    return result
+
+
+def _cache_get(key: str) -> dict[str, Any] | None:
+    with _disclosures_cache_lock:
+        entry = _disclosures_cache.get(key)
+        if entry and time.time() - entry["ts"] < _DISCLOSURES_TTL:
+            return entry["val"]
+    return None
+
+
+def _cache_set(key: str, value: dict[str, Any]) -> None:
+    with _disclosures_cache_lock:
+        _disclosures_cache[key] = {"val": value, "ts": time.time(), "ttl": _DISCLOSURES_TTL}
 
 
 def _fetch_all_pages(

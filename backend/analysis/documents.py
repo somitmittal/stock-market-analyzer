@@ -12,6 +12,23 @@ import requests
 
 REQUEST_TIMEOUT_SECONDS = 15
 
+
+def fetch_pdf_text(document_url: str, max_pages: int = 40) -> str | None:
+    try:
+        response = requests.get(
+            document_url,
+            headers={"User-Agent": "StockMarketAnalyzer/1.0"},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        reader = PdfReader(BytesIO(response.content))
+        pages = [(page.extract_text() or "") for page in reader.pages[:max_pages]]
+        text = "\n".join(pages)
+        normalized = re.sub(r"\s+", " ", text).strip()
+        return normalized or None
+    except Exception:
+        return None
+
 SECTION_PATTERNS = {
     "risk_factors": ("risk factors",),
     "objects_of_issue": ("objects of the issue", "objects of the offer"),
@@ -24,16 +41,10 @@ SECTION_PATTERNS = {
 
 
 def analyze_offer_document(document_url: str) -> dict[str, Any]:
-    response = requests.get(
-        document_url,
-        headers={"User-Agent": "StockMarketAnalyzer/1.0"},
-        timeout=REQUEST_TIMEOUT_SECONDS,
-    )
-    response.raise_for_status()
-    reader = PdfReader(BytesIO(response.content))
-    pages = [(page.extract_text() or "") for page in reader.pages]
-    text = "\n".join(pages)
-    normalized = re.sub(r"\s+", " ", text)
+    normalized = fetch_pdf_text(document_url, max_pages=200)
+    if not normalized:
+        raise ValueError("Could not extract text from offer document")
+    pages_read = max(1, len(normalized) // 2000)
 
     sections = {
         name: _extract_section_excerpt(normalized, headings)
@@ -43,8 +54,8 @@ def analyze_offer_document(document_url: str) -> dict[str, Any]:
 
     return {
         "document_url": document_url,
-        "pages_read": len(pages),
-        "characters_extracted": len(text),
+        "pages_read": pages_read,
+        "characters_extracted": len(normalized),
         "sections": sections,
         "coverage": {
             "available_sections": available_sections,

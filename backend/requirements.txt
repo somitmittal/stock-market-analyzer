@@ -12,3 +12,6 @@ beautifulsoup4>=4.12.0
 aiohttp>=3.10.0
 pypdf>=6.0.0
 bse>=3.3.1
+PyJWT>=2.9.0
+bcrypt>=4.2.0
+email-validator>=2.2.0

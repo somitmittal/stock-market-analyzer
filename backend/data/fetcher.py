@@ -30,19 +30,46 @@ _cache: dict[str, dict] = {}
 _cache_lock = threading.Lock()
 
 _OHLCV_TTL = 300       # 5 minutes — price data refreshes often
+QUOTE_TTL = _OHLCV_TTL // 5  # Markets/LTP: 60s (1/5 of OHLCV TTL)
 _FUNDAMENTAL_TTL = 21600  # 6 hours — fundamentals rarely change intraday
 _NEWS_TTL = 3600        # 1 hour
+# Cap in-memory Yahoo/OHLCV entries so long sessions don't retain unbounded frames.
+_CACHE_MAX_ENTRIES = 256
+# Short lookbacks should not pull IndianAPI 5yr history (Markets was doing this ×8).
+_SHORT_YF_PERIODS = frozenset({"1d", "5d", "1mo", "3mo"})
+_YF_PERIOD_TO_INDIAN = {
+    "1d": "1mo",
+    "5d": "1mo",
+    "1mo": "1mo",
+    "3mo": "1yr",
+    "6mo": "1yr",
+    "1y": "1yr",
+    "2y": "3yr",
+    "5y": "5yr",
+    "max": "max",
+}
 
 def _cache_get(key: str) -> any:
     with _cache_lock:
         entry = _cache.get(key)
         if entry and time.time() - entry["ts"] < entry["ttl"]:
             return entry["val"]
+        if entry:
+            _cache.pop(key, None)
     return None
 
 def _cache_set(key: str, val: any, ttl: int):
     with _cache_lock:
         _cache[key] = {"val": val, "ts": time.time(), "ttl": ttl}
+        if len(_cache) > _CACHE_MAX_ENTRIES:
+            # Drop oldest expired/stale entries first, then oldest by timestamp.
+            now = time.time()
+            expired = [k for k, e in _cache.items() if now - e["ts"] >= e["ttl"]]
+            for k in expired:
+                _cache.pop(k, None)
+            while len(_cache) > _CACHE_MAX_ENTRIES:
+                oldest = min(_cache.items(), key=lambda item: item[1]["ts"])[0]
+                _cache.pop(oldest, None)
 
 def yfinance_enabled() -> bool:
     """Yahoo is blocked on Render shared IPs. Keep it off there unless explicitly enabled."""
@@ -79,31 +106,44 @@ def resolve_indian_symbol(symbol: str, exchange: str = "NSE") -> str:
     return symbol + suffix
 
 
-def get_stock_data(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
+def get_stock_data(
+    symbol: str,
+    period: str = "1y",
+    interval: str = "1d",
+    *,
+    prefer_yahoo: bool | None = None,
+) -> pd.DataFrame:
     cache_key = f"ohlcv:{symbol}:{period}:{interval}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    last_error = None
-    if not symbol.startswith("^"):
-        df = _ohlcv_from_indian_api(symbol, interval)
-        if df is not None and not df.empty:
-            _cache_set(cache_key, df, _OHLCV_TTL)
-            return df
+    # Quotes / short lookbacks: Yahoo first. Full chart history: IndianAPI first when configured.
+    if prefer_yahoo is None:
+        prefer_yahoo = period in _SHORT_YF_PERIODS or symbol.startswith("^")
 
-    if yfinance_enabled():
-        try:
-            ticker = _get_ticker(symbol)
-            df = ticker.history(period=period, interval=interval)
-            if not df.empty:
-                df.attrs["ohlcv_provider"] = "Yahoo Finance"
-                df.attrs["synthetic_ohlc"] = False
+    last_error = None
+    providers = (
+        ("yahoo", "indian_api") if prefer_yahoo else ("indian_api", "yahoo")
+    )
+    for provider in providers:
+        if provider == "indian_api" and not symbol.startswith("^"):
+            df = _ohlcv_from_indian_api(symbol, interval, period)
+            if df is not None and not df.empty:
                 _cache_set(cache_key, df, _OHLCV_TTL)
                 return df
-        except Exception as exc:
-            last_error = exc
-            logger.warning("Yahoo OHLCV failed for %s: %s", symbol, exc)
+        elif provider == "yahoo" and yfinance_enabled():
+            try:
+                ticker = _get_ticker(symbol)
+                df = ticker.history(period=period, interval=interval)
+                if not df.empty:
+                    df.attrs["ohlcv_provider"] = "Yahoo Finance"
+                    df.attrs["synthetic_ohlc"] = False
+                    _cache_set(cache_key, df, _OHLCV_TTL)
+                    return df
+            except Exception as exc:
+                last_error = exc
+                logger.warning("Yahoo OHLCV failed for %s: %s", symbol, exc)
 
     detail = f" ({last_error})" if last_error else ""
     raise ValueError(
@@ -112,9 +152,19 @@ def get_stock_data(symbol: str, period: str = "1y", interval: str = "1d") -> pd.
     )
 
 
-def _ohlcv_from_indian_api(symbol: str, interval: str) -> pd.DataFrame | None:
+def _map_period_to_indian(period: str, interval: str) -> str:
+    from data.indian_api import PERIOD_BY_INTERVAL
+
+    mapped = _YF_PERIOD_TO_INDIAN.get(period)
+    if mapped:
+        return mapped
+    return PERIOD_BY_INTERVAL.get(interval, "5yr")
+
+
+def _ohlcv_from_indian_api(
+    symbol: str, interval: str, period: str = "1y"
+) -> pd.DataFrame | None:
     from data.indian_api import (
-        PERIOD_BY_INTERVAL,
         fetch_historical_market_data,
         history_to_ohlcv,
         is_configured,
@@ -122,9 +172,11 @@ def _ohlcv_from_indian_api(symbol: str, interval: str) -> pd.DataFrame | None:
 
     if not is_configured():
         return None
-    api_period = PERIOD_BY_INTERVAL.get(interval, "5yr")
+    api_period = _map_period_to_indian(period, interval)
     result = fetch_historical_market_data(symbol, period=api_period)
-    if result.get("provenance", {}).get("status") != "ok":
+    status = result.get("provenance", {}).get("status")
+    # Accept fresh or stale_cache — both carry usable price series.
+    if status not in ("ok", "stale_cache"):
         logger.warning(
             "IndianAPI history unavailable for %s: %s",
             symbol,

@@ -9,3 +9,6 @@ dist/
 build/
 .worktrees/
 backend/data/nse_symbols.json
+backend/data/.api_cache/
+*.db
+backend/data/app.db
