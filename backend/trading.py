@@ -55,6 +55,49 @@ def get_wallet(user_id: int) -> dict[str, Any]:
     }
 
 
+def _quote_payload(
+    resolved: str, exchange: str, close: float, change_pct: float
+) -> dict[str, Any]:
+    return {
+        "symbol": resolved.upper().replace(".NS", "").replace(".BO", ""),
+        "exchange": exchange.upper(),
+        "yf_symbol": resolved.upper(),
+        "ltp": round(close, 2),
+        "change_pct": round(change_pct, 2),
+        "available": True,
+    }
+
+
+def _quote_from_indian_snapshot(resolved: str, exchange: str) -> dict[str, Any] | None:
+    """LTP from /stock snapshot — one light call, not 5yr /historical_data."""
+    from data.indian_api import fetch_stock_snapshot, is_configured
+
+    if not is_configured():
+        return None
+    result = fetch_stock_snapshot(resolved)
+    if result.get("provenance", {}).get("status") not in ("ok", "stale_cache"):
+        return None
+    data = result.get("data") or {}
+    prices = data.get("currentPrice") or {}
+    close = None
+    for key in (exchange.upper(), "NSE", "BSE"):
+        if prices.get(key) is not None:
+            try:
+                close = float(prices[key])
+                break
+            except (TypeError, ValueError):
+                continue
+    if close is None:
+        return None
+    # Snapshot has no prior close; percentChange when IndianAPI provides it.
+    raw_chg = data.get("percentChange")
+    try:
+        change_pct = float(raw_chg) if raw_chg is not None else 0.0
+    except (TypeError, ValueError):
+        change_pct = 0.0
+    return _quote_payload(resolved, exchange, close, change_pct)
+
+
 def get_quote(symbol: str, exchange: str = "NSE") -> dict[str, Any]:
     resolved = resolve_indian_symbol(symbol, exchange)
     cache_key = f"{resolved}:{exchange.upper()}"
@@ -63,31 +106,41 @@ def get_quote(symbol: str, exchange: str = "NSE") -> dict[str, Any]:
         if entry and time.time() - entry["ts"] < QUOTE_TTL:
             return entry["val"]
 
-    try:
-        # Short lookback + Yahoo-first (see fetcher) — never pull IndianAPI 5yr for LTP.
-        df = get_stock_data(resolved, period="5d", interval="1d", prefer_yahoo=True)
-        df = df.dropna(subset=["Close"])
-        if df.empty:
-            raise ValueError("No price")
-        close = float(df["Close"].iloc[-1])
-        prev = float(df["Close"].iloc[-2]) if len(df) > 1 else close
-        change_pct = ((close - prev) / prev * 100) if prev else 0
-        quote = {
-            "symbol": resolved.upper().replace(".NS", "").replace(".BO", ""),
-            "exchange": exchange.upper(),
-            "yf_symbol": resolved.upper(),
-            "ltp": round(close, 2),
-            "change_pct": round(change_pct, 2),
-            "available": True,
-        }
-        with _quote_lock:
-            _quote_cache[cache_key] = {"val": quote, "ts": time.time()}
-            if len(_quote_cache) > 128:
-                oldest = min(_quote_cache.items(), key=lambda item: item[1]["ts"])[0]
-                _quote_cache.pop(oldest, None)
-        return quote
-    except Exception as exc:
-        raise HTTPException(status_code=404, detail=f"Quote unavailable for {symbol}: {exc}") from exc
+    last_error: Exception | None = None
+    quote: dict[str, Any] | None = None
+
+    # 1) Yahoo short bars when enabled (local / ENABLE_YFINANCE).
+    if yfinance_enabled():
+        try:
+            df = get_stock_data(resolved, period="5d", interval="1d", prefer_yahoo=True)
+            df = df.dropna(subset=["Close"])
+            if not df.empty:
+                close = float(df["Close"].iloc[-1])
+                prev = float(df["Close"].iloc[-2]) if len(df) > 1 else close
+                change_pct = ((close - prev) / prev * 100) if prev else 0
+                quote = _quote_payload(resolved, exchange, close, change_pct)
+        except Exception as exc:
+            last_error = exc
+
+    # 2) On Render (Yahoo off), use IndianAPI snapshot — never fan out 5yr history.
+    if quote is None:
+        try:
+            quote = _quote_from_indian_snapshot(resolved, exchange)
+        except Exception as exc:
+            last_error = exc
+
+    if quote is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Quote unavailable for {symbol}: {last_error or 'no price source'}",
+        )
+
+    with _quote_lock:
+        _quote_cache[cache_key] = {"val": quote, "ts": time.time()}
+        if len(_quote_cache) > 128:
+            oldest = min(_quote_cache.items(), key=lambda item: item[1]["ts"])[0]
+            _quote_cache.pop(oldest, None)
+    return quote
 
 
 def place_stock_order(
