@@ -7,10 +7,6 @@ services:
     buildCommand: pip install -r backend/requirements.txt
     startCommand: cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/health
-    disk:
-      name: nivesh-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.9"
@@ -24,5 +20,7 @@ services:
         sync: false
       - key: JWT_SECRET
         generateValue: true
+      # Free tier has no persistent disk — SQLite lives on the instance filesystem
+      # and resets on redeploy. Upgrade + add a disk if you need durable wallets.
       - key: DATABASE_PATH
-        value: /var/data/app.db
+        value: /opt/render/project/src/backend/data/app.db
