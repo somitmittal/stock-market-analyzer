@@ -418,7 +418,9 @@ def market_overview() -> dict[str, Any]:
         "note": "Live quotes via Yahoo Finance (preferred) with short-cache; IndianAPI reserved for research.",
         "cache_ttl_seconds": _MARKETS_TTL,
     }
-    with _markets_lock:
-        _markets_cache["data"] = payload
-        _markets_cache["ts"] = time.time()
+    # Don't cache an all-empty watch — that locks Markets into "unavailable" for a full TTL.
+    if any(item.get("available") for item in items):
+        with _markets_lock:
+            _markets_cache["data"] = payload
+            _markets_cache["ts"] = time.time()
     return payload

@@ -10,8 +10,10 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.9"
+      # Quotes/Markets use Yahoo (short 5d bars, 60s cache). Leave unset so
+      # Yahoo works on Render; IndianAPI remains primary for research/analyze.
       - key: DISABLE_YFINANCE
-        value: "true"
+        value: "false"
       - key: INDIAN_API_BASE_URL
         value: https://stock.indianapi.in
       - key: INDIAN_API_KEY
